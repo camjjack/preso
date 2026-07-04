@@ -94,6 +94,7 @@ class PresoVideo < Formula
     sha256 "$(sha "$linux_video")"
 
     depends_on arch: :x86_64
+    depends_on "patchelf" => :build
   end
 
   depends_on "gstreamer"
@@ -102,6 +103,18 @@ class PresoVideo < Formula
 
   def install
     bin.install "preso"
+    if OS.mac?
+      # The release binary links GStreamer through upstream's
+      # @rpath/libgst*.dylib install names but ships no LC_RPATH of its
+      # own; point it at brew's GStreamer. Editing load commands
+      # invalidates the ad-hoc signature on Apple Silicon, so re-sign.
+      system "install_name_tool", "-add_rpath",
+             Formula["gstreamer"].opt_lib.to_s, bin/"preso"
+      system "codesign", "--force", "--sign", "-", bin/"preso"
+    else
+      # Linuxbrew's GStreamer lives outside the default loader paths.
+      system "patchelf", "--add-rpath", HOMEBREW_PREFIX/"lib", bin/"preso"
+    end
   end
 
   test do

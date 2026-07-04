@@ -36,6 +36,14 @@ jobs:
             target: aarch64-apple-darwin
             features: video
             suffix: -video
+            # The official GStreamer framework's dylibs carry
+            # @rpath/libgst*.dylib install names, so the binary needs
+            # LC_RPATH entries or dyld can't find GStreamer at all.
+            # Embed both common locations: the framework (direct-download
+            # users) and Homebrew (the tap's depends_on "gstreamer").
+            rustflags: >-
+              -C link-arg=-Wl,-rpath,/Library/Frameworks/GStreamer.framework/Versions/1.0/lib
+              -C link-arg=-Wl,-rpath,/opt/homebrew/lib
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             features: video
@@ -76,6 +84,8 @@ jobs:
       # `preso-convert` importer, the video builds add `--features video`
       # instead. (Skips the repros/* crates, which would pull in wgpu.)
       - name: Build
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags || '' }}
         run: cargo build --release --target ${{ matrix.target }} --bin preso ${{ matrix.features && format('--features {0}', matrix.features) || '--bin preso-convert' }}
 
       - name: Package (Unix)
