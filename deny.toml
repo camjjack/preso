@@ -32,6 +32,12 @@ allow = [
     "ISC",
     "MIT",
     "MPL-2.0",
+    # Permissive BSD-style (OSI/FSF approved). Reaches the graph only
+    # under --all-features (what CI's deny action runs): the video
+    # feature → iced_video_player → iced's full `image` feature →
+    # image's default formats → AVIF (ravif → rav1e → libfuzzer-sys,
+    # "(MIT OR Apache-2.0) AND NCSA").
+    "NCSA",
     "Unicode-3.0",
     "Unlicense",
     "Zlib",
