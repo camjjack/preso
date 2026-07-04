@@ -1,0 +1,14 @@
+/target
+**/*.rs.bk
+*.pending-snap
+.DS_Store
+/spike-output
+
+# Local PDF-export output
+/out.pdf
+*.pdf
+
+# mdBook build output (the guide is deployed from CI)
+/docs/guide/book
+dist/
+/result

@@ -1,0 +1,23 @@
+# preso built-in theme: light (Catppuccin Latte palette)
+name = "light"
+code_theme = "InspiredGitHub"
+
+[colors]
+background = "#eff1f5"
+text = "#4c4f69"
+heading = "#1e66f5"
+accent = "#ea76cb"
+link = "#209fb5"
+muted = "#9ca0b0"
+code_background = "#e6e9ef"
+
+[fonts]
+body_size = 36
+h1_size = 80
+h2_size = 56
+h3_size = 44
+code_size = 30
+
+[spacing]
+slide_padding = 60
+paragraph_gap = 20

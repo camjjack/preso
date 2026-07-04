@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=preso
+Comment=Native markdown presentations
+Exec=preso %f
+TryExec=preso
+Icon=preso
+Terminal=false
+Categories=Office;Presentation;
+MimeType=text/markdown;
+StartupWMClass=preso

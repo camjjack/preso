@@ -1,0 +1,67 @@
+name: Homebrew tap
+
+# When a release is *published* (drafts don't fire this), regenerate the
+# tap formulae from the published artifacts and push them to
+# camjjack/homebrew-preso. Publishing the release first matters: the
+# formula URLs point at releases/download/, which 404s for drafts.
+#
+# One-time setup (docs/publishing.md → "Homebrew tap"): create the tap
+# repo and add a TAP_GITHUB_TOKEN secret with push access to it. Without
+# the secret every step no-ops with a notice instead of failing.
+on:
+  release:
+    types: [published]
+  # Re-run for an already-published tag (e.g. after fixing this workflow).
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Published release tag (e.g. v0.1.0)"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  update-tap:
+    name: Update tap formulae
+    runs-on: ubuntu-latest
+    env:
+      TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+    steps:
+      - name: Skip notice
+        if: env.TAP_GITHUB_TOKEN == ''
+        run: echo "::notice::TAP_GITHUB_TOKEN is not configured; skipping the tap update."
+
+      - uses: actions/checkout@v7
+        if: env.TAP_GITHUB_TOKEN != ''
+
+      - name: Download release tarballs
+        if: env.TAP_GITHUB_TOKEN != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern 'preso-*.tar.gz' --dir release-assets
+
+      - name: Generate formulae
+        if: env.TAP_GITHUB_TOKEN != ''
+        run: scripts/gen-homebrew-formulae.sh "${TAG#v}" release-assets formulae
+
+      - name: Push to camjjack/homebrew-preso
+        if: env.TAP_GITHUB_TOKEN != ''
+        run: |
+          git clone --depth 1 \
+            "https://x-access-token:${TAP_GITHUB_TOKEN}@github.com/camjjack/homebrew-preso.git" tap
+          mkdir -p tap/Formula
+          cp formulae/*.rb tap/Formula/
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula
+          if git diff --cached --quiet; then
+            echo "formulae unchanged; nothing to push"
+            exit 0
+          fi
+          git commit -m "preso ${TAG}"
+          git push

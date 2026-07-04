@@ -1,0 +1,19 @@
+[package]
+name = "preso-export"
+description = "PDF assembly for preso (bitmap-per-slide)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+# The PDF is assembled directly with lopdf so each slide image can pick its own
+# codec (lossless Flate for flat/text slides, JPEG for photographic ones) —
+# printpdf only allows one codec for the whole document.
+lopdf = { version = "0.42", default-features = false, features = ["time"] }
+image = { workspace = true }
+flate2 = "1"
+thiserror = { workspace = true }

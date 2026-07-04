@@ -1,0 +1,127 @@
+# Example Theme v3 theme: gradient background, accent bar, and a logo
+# watermark on every slide. Try it:
+#
+#     preso docs/example-talk.md --theme docs/themes/corporate.toml
+#
+name = "corporate"
+code_theme = "SolarizedDark"
+
+[colors]
+background = "#0f2027"     # used by the presenter chrome and as fallback
+text = "#e6edf3"
+heading = "#7dd3fc"
+accent = "#f9a8d4"
+link = "#7dd3fc"
+muted = "#94a3b8"
+code_background = "#0b141a"
+
+[fonts]
+body_size = 36
+h1_size = 80
+h2_size = 56
+h3_size = 44
+code_size = 30
+# Families must be loaded fonts: bundled (Inter, JetBrains Mono), listed
+# in `files` below (paths relative to this file), or installed.
+# body_family = "Source Sans 3"
+# files = ["SourceSans3-Regular.ttf"]
+
+[spacing]
+slide_padding = 60
+paragraph_gap = 20
+
+[slide]
+align = "top"
+# Full-bleed backdrop for every slide (cover-fit, content on top). Path
+# relative to this theme file. Per-slide `<!-- slide: background=... -->`
+# overrides it. Commented out by default; uncomment to try.
+# background_image = "backdrop.png"
+# Linear gradient, angle in degrees (0 = `to` at the top, 180 = bottom).
+gradient = { from = "#0f2027", to = "#2c5364", angle = 160 }
+# A solid band along one edge. `reserve = true` keeps slide content clear
+# of the band (the logo and slide number still draw over it).
+bar = { side = "right", size = 24, color = "#f9a8d4", reserve = true }
+# Watermark on every slide; path relative to this theme file.
+logo = { path = "preso-logo.png", width = 8, position = "bottom-right", opacity = 0.4 }
+
+# Default framing for content images: a border (color falls back to
+# `muted`, sizes in design units) and a drop shadow (`true` for the
+# default look, or { color, offset, blur }). Per-image markdown flags
+# override: ![x](a.png){border shadow} forces them on, {plain} strips.
+[image]
+shadow = true
+
+# Markdown table styling. Unset fields fall back to palette-derived
+# defaults. Sizes are design units.
+[table]
+header_background = "#1e293b"
+header_color = "#f8fafc"
+stripe_background = "#0f1b2e"   # zebra striping on alternate rows
+border_color = "#334155"
+border_width = 1
+padding = 12
+border_radius = 6
+
+# Blockquote (`> …`) callouts: a leading accent bar, optional fill, and
+# placement. `border_color` falls back to `accent`; sizes are design units.
+[quote]
+background = "#0f1b2e"
+border_color = "#f9a8d4"
+border_width = 6
+padding = 20
+border_radius = 6
+italic = true
+
+# Slide number on every slide. `{current}` and `{total}` expand; size is
+# in design units; font falls back to the body font; color to `muted`.
+# `padding_x`/`padding_y` (design units, default 24) offset it from the
+# anchored corner — size them against the bars to clear them. The number is
+# anchored by its *center*, so it stays put as the digit count grows; the
+# logo (same fields) is inset by its edge.
+[slide_number]
+format = "{current} / {total}"
+size = 24
+position = "bottom-left"
+padding_x = 40
+padding_y = 28
+# font = "JetBrains Mono"
+# color = "#94a3b8"
+
+# Small disclaimer line along the bottom for slides that carry a
+# `<!-- footnote: ... -->` directive (e.g. image credits). The directive
+# decides which slides show one; this just styles it. `padding_x` matches
+# `slide_padding` so the line lines up with the content's left edge.
+[footnote]
+size = 18
+align = "left"          # left | center | right
+padding_x = 60
+padding_y = 36
+# color = "#94a3b8"
+# font = "JetBrains Mono"
+
+# Kind overlays: slides marked `<!-- slide: kind=title -->` (or
+# `kind=section`) render with these partial themes; anything not set
+# here falls back to the sections above.
+[title.fonts]
+h1_size = 110
+
+[title.slide]
+align = "center"        # vertical: top | center
+halign = "center"       # horizontal: left | center | right
+gradient = { from = "#2c5364", to = "#0f2027", angle = 20 }
+logo = { hidden = true }
+# `bars` (plural) gives this kind multiple bands and replaces the base's
+# single `bar`; here a matched pair top and bottom for title slides.
+bars = [
+  { side = "top", size = 16, color = "#f9a8d4" },
+  { side = "bottom", size = 16, color = "#f9a8d4" },
+]
+
+[title.slide_number]
+hidden = true
+
+[section.slide]
+align = "center"
+
+[section.heading]
+color = "#f9a8d4"

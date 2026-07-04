@@ -1,0 +1,177 @@
+name: Release
+
+# Builds release binaries for macOS (Apple Silicon + Intel), Linux, and
+# Windows on every `v*` tag, then collects them into a single draft GitHub
+# Release for review before publishing.
+on:
+  push:
+    tags: ["v*"]
+  # Allow a dry run (build artifacts, skip the release) from the Actions tab.
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Standard binaries: no system deps beyond the usual. Each bundles
+          # `preso` (video plays via an external player) and the `preso-convert`
+          # importer.
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          # Inline-video binaries (`--features video`). These link GStreamer, so
+          # they require it installed at *run* time too — separate `-video`
+          # artifacts so the standard ones stay dependency-free.
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            features: video
+            suffix: -video
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            features: video
+            suffix: -video
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            features: video
+            suffix: -video
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}${{ matrix.suffix }}
+
+      # Same X11 clipboard + xkbcommon libraries as CI; the software
+      # renderer needs no GPU/GTK packages.
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libxkbcommon-dev \
+            libxcb1-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev
+
+      # GStreamer (runtime + dev) for the inline-video builds only. The macOS
+      # package is a universal framework, so it covers both mac targets.
+      - name: Install GStreamer
+        if: matrix.features == 'video'
+        uses: ./.github/actions/gstreamer
+
+      # `preso` always; the standard (non-video) builds also produce the
+      # `preso-convert` importer, the video builds add `--features video`
+      # instead. (Skips the repros/* crates, which would pull in wgpu.)
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }} --bin preso ${{ matrix.features && format('--features {0}', matrix.features) || '--bin preso-convert' }}
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          name="preso-${GITHUB_REF_NAME:-dev}-${{ matrix.target }}${{ matrix.suffix }}"
+          bin="target/${{ matrix.target }}/release"
+          mkdir "$name"
+          cp "$bin/preso" "$name/"
+          # Present in the standard builds only.
+          [ -f "$bin/preso-convert" ] && cp "$bin/preso-convert" "$name/"
+          # No CHANGELOG.md: private-only, absent from the public repo
+          # where releases run.
+          cp README.md LICENSE-MIT LICENSE-APACHE "$name/"
+          tar czf "$name.tar.gz" "$name"
+          echo "ASSET=$name.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $name = "preso-$($env:GITHUB_REF_NAME ?? 'dev')-${{ matrix.target }}${{ matrix.suffix }}"
+          $bin = "target/${{ matrix.target }}/release"
+          New-Item -ItemType Directory -Path $name | Out-Null
+          Copy-Item "$bin/preso.exe" $name
+          # Present in the standard builds only.
+          if (Test-Path "$bin/preso-convert.exe") { Copy-Item "$bin/preso-convert.exe" $name }
+          # No CHANGELOG.md: private-only, absent from the public repo.
+          Copy-Item README.md, LICENSE-MIT, LICENSE-APACHE $name
+          Compress-Archive -Path $name -DestinationPath "$name.zip"
+          "ASSET=$name.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: preso-${{ matrix.target }}${{ matrix.suffix }}
+          path: ${{ env.ASSET }}
+          if-no-files-found: error
+
+  # Debian packages (x86_64): the standard build, plus a `preso-video`
+  # variant whose Depends pull in the GStreamer runtime that inline
+  # playback needs (see [package.metadata.deb] in preso-app's Cargo.toml —
+  # the plugins are dlopened, so they must be declared, not auto-detected).
+  deb:
+    name: Debian package (${{ matrix.variant }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [standard, video]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: deb-${{ matrix.variant }}
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libxkbcommon-dev \
+            libxcb1-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev
+      - name: Install GStreamer
+        if: matrix.variant == 'video'
+        uses: ./.github/actions/gstreamer
+      - name: Install cargo-deb
+        run: cargo install cargo-deb --locked
+      - name: Build .deb
+        run: cargo deb -p preso-app ${{ matrix.variant == 'video' && '--variant video' || '' }}
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: preso-deb-${{ matrix.variant }}
+          path: target/debian/*.deb
+          if-no-files-found: error
+
+  release:
+    name: Draft release
+    needs: [build, deb]
+    runs-on: ubuntu-latest
+    # Only publish a release for an actual tag, not for manual dry runs.
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Create draft release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: artifacts/*
+          draft: true
+          generate_release_notes: true

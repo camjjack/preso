@@ -1,0 +1,23 @@
+# preso built-in theme: dark (Catppuccin Mocha palette)
+name = "dark"
+code_theme = "base16-ocean.dark"
+
+[colors]
+background = "#1e1e2e"
+text = "#cdd6f4"
+heading = "#89b4fa"
+accent = "#f5c2e7"
+link = "#74c7ec"
+muted = "#6c7086"
+code_background = "#11111b"
+
+[fonts]
+body_size = 36
+h1_size = 80
+h2_size = 56
+h3_size = 44
+code_size = 30
+
+[spacing]
+slide_padding = 60
+paragraph_gap = 20

@@ -1,0 +1,23 @@
+[package]
+name = "preso-convert"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+description = "Convert Slidev decks and PowerPoint files into preso markdown format"
+
+[[bin]]
+name = "preso-convert"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true }
+serde_norway = { workspace = true }
+anyhow = { workspace = true }
+# PowerPoint (.pptx) import: a zip of XML. Deflate only (pptx never uses
+# bzip2/zstd/aes), and roxmltree is already in the tree via resvg.
+zip = { version = "2", default-features = false, features = ["deflate"] }
+roxmltree = "0.20"

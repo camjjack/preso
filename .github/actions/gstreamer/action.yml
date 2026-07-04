@@ -1,0 +1,62 @@
+name: Install GStreamer
+description: >
+  Install GStreamer (runtime + development files) for building preso's `video`
+  feature, on Linux, macOS, or Windows, and export the env the build needs.
+
+# Manual per-OS installs — there's no maintained cross-platform action (the
+# formerly-used `blinemedical/setup-gstreamer` was archived). Versions are
+# pinned here; bump as needed. Linux uses distro dev packages; macOS uses the
+# official *universal* framework (covers both Apple-Silicon and Intel targets);
+# Windows uses the MSVC .exe installer (1.28+ replaced the MSIs with a single
+# .exe: `/TYPE=devel` selects runtime + development files, `/VERYSILENT
+# /ALLUSERS` installs unattended into "C:\Program Files\gstreamer").
+runs:
+  using: composite
+  steps:
+    - name: Install GStreamer (Linux)
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          libgstreamer1.0-dev \
+          libgstreamer-plugins-base1.0-dev
+
+    - name: Install GStreamer (macOS)
+      if: runner.os == 'macOS'
+      shell: bash
+      run: |
+        ver=1.28.4
+        base="https://gstreamer.freedesktop.org/data/pkg/osx/$ver"
+        for pkg in "gstreamer-1.0-$ver-universal.pkg" "gstreamer-1.0-devel-$ver-universal.pkg"; do
+          curl -fsSL -o "/tmp/$pkg" "$base/$pkg"
+          sudo installer -pkg "/tmp/$pkg" -target /
+        done
+        # gstreamer-rs finds the framework via pkg-config.
+        brew list pkg-config >/dev/null 2>&1 || brew install pkg-config
+        echo "PKG_CONFIG_PATH=/Library/Frameworks/GStreamer.framework/Versions/1.0/lib/pkgconfig" >> "$GITHUB_ENV"
+
+    - name: Install GStreamer (Windows)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        # glib-sys/gstreamer-sys resolve the libraries via pkg-config, which the
+        # GStreamer MSVC package doesn't ship — install one.
+        choco install --yes --no-progress pkgconfiglite
+        $ver = '1.28.4'
+        $base = "https://gstreamer.freedesktop.org/data/pkg/windows/$ver/msvc"
+        curl.exe -fsSL -o "$env:TEMP\gstreamer-1.0-msvc-x86_64-$ver.exe" "$base/gstreamer-1.0-msvc-x86_64-$ver.exe"
+        Start-Process "$env:TEMP\gstreamer-1.0-msvc-x86_64-$ver.exe" -Wait -ArgumentList "/TYPE=devel", "/ALLUSERS", "/VERYSILENT"
+        $root = "C:\Program Files\gstreamer\1.0\msvc_x86_64"
+        # gstreamer-rs reads GSTREAMER_1_0_ROOT_MSVC_X86_64; the .pc files live in
+        # lib/pkgconfig and the DLLs in bin.
+        "GSTREAMER_1_0_ROOT_MSVC_X86_64=$root" | Out-File -FilePath $env:GITHUB_ENV -Append
+        "PKG_CONFIG_PATH=$root\lib\pkgconfig" | Out-File -FilePath $env:GITHUB_ENV -Append
+        "$root\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+
+        # Fail fast with a clear message if the install layout isn't what we expect.
+        if (-not (Test-Path "$root\lib\pkgconfig\glib-2.0.pc")) {
+          Write-Host "== root ($root) =="
+          Get-ChildItem $root -ErrorAction SilentlyContinue | Select-Object -Expand Name
+          throw "glib-2.0.pc not found under $root\lib\pkgconfig — GStreamer install layout changed"
+        }

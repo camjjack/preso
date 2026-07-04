@@ -1,0 +1,50 @@
+# cargo-deny configuration — plan §13.2's dependency gate: advisories,
+# unmaintained crates, license surprises, and untrusted sources, caught in
+# CI instead of after they ship (the `serde_yaml` lesson).
+#
+# Run locally with `cargo deny check`.
+
+[advisories]
+ignore = [
+    { id = "RUSTSEC-2025-0141", reason = "bincode 1.x unmaintained, via syntect → two-face (iced's highlighter). Only deserializes the crates' own bundled syntax/theme dumps, never untrusted input; resolves when syntect moves on." },
+    { id = "RUSTSEC-2025-0057", reason = "fxhash unmaintained, via display-info. A hash function with no untrusted input in this use; no safe upgrade exists." },
+    { id = "RUSTSEC-2024-0436", reason = "paste unmaintained, via wgpu's metal backend. Compile-time proc-macro only; the whole wgpu ecosystem carries this until upstream drops it." },
+    { id = "RUSTSEC-2026-0194", reason = "quick-xml 0.30 quadratic parse on crafted XML, pinned by xcb (parses the X11 protocol definitions bundled in the crate at build time) and plist → syntect (bundled .tmTheme files). No attacker-controlled XML reaches it." },
+    { id = "RUSTSEC-2026-0195", reason = "second advisory against the same quick-xml 0.30 pin as above." },
+    { id = "RUSTSEC-2026-0192", reason = "ttf-parser unmaintained. Used directly (reading bundled/theme font name tables) and throughout the resvg/fontdb/iced font stack; the ecosystem has no replacement yet. Inputs are fonts we ship or the user installs, not attacker files." },
+    { id = "RUSTSEC-2024-0320", reason = "yaml-rust unmaintained, via syntect (parses its own bundled .sublime-syntax definitions, not untrusted input). Resolves when syntect migrates." },
+]
+
+[licenses]
+# preso itself is MIT OR Apache-2.0. Everything below is permissive; the
+# lone MPL-2.0 (option-ext, via dirs) is file-level weak copyleft, fine to
+# link. GPL/LGPL identifiers appear in the graph only as OR-alternatives of
+# dual-licensed crates (self_cell, r-efi) and are satisfied by the
+# permissive arm, so they are deliberately not allowed here.
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "ISC",
+    "MIT",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+
+[bans]
+# The iced/wgpu tree carries unavoidable duplicate versions; flagging them
+# is pure noise. Wildcard version requirements stay banned (path-only
+# workspace members excepted).
+multiple-versions = "allow"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

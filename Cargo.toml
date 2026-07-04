@@ -1,0 +1,62 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/camjjack/preso"
+authors = ["Cameron Jack <camjjack@gmail.com>"]
+
+[workspace.dependencies]
+preso-core = { path = "crates/preso-core" }
+preso-style = { path = "crates/preso-style" }
+preso-diagram = { path = "crates/preso-diagram" }
+preso-export = { path = "crates/preso-export" }
+
+# GUI
+# `image-without-codecs` lets the shared `image` crate (see
+# below) decide which codecs to compile instead of pulling all of them.
+iced = { version = "0.14", default-features = false, features = ["tiny-skia", "crisp", "web-colors", "thread-pool", "linux-theme-detection", "x11", "wayland", "markdown", "highlighter", "image-without-codecs", "canvas"] }
+
+# App plumbing
+clap = { version = "4.5", features = ["derive"] }
+open = "5"
+notify-debouncer-full = "0.7"
+dirs = "6"
+
+# Parsing
+serde = { version = "1", features = ["derive"] }
+serde_norway = "0.9"
+toml = "0.8"
+
+# Errors & logging
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+# Rendering pipeline
+resvg = "0.46"
+# Only the codecs preso actually decodes: PNG (logos, backgrounds, export
+# snapshots), GIF (animations), JPEG (`.jpg` backgrounds). Drops webp/exr/
+# tiff/bmp/ico/etc. decoders that `image`'s defaults would pull in.
+image = { version = "0.25", default-features = false, features = ["png", "gif", "jpeg"] }
+
+[profile.release]
+# Size-tuned: fat LTO + single codegen unit maximize cross-crate dead-code
+# elimination; abort-on-panic drops the unwinding tables. opt-level stays
+# at 3 — the tiny-skia software renderer is hot and shouldn't be detuned.
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.dev]
+# Faster iteration; spikes and app are GPU-bound anyway
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2

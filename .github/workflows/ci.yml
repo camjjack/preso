@@ -1,0 +1,106 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Linux build/link dependencies. preso uses the tiny-skia software
+      # renderer (no GPU, no GTK), so the only system libraries it links
+      # are for X11 clipboard support (the `xcb` crate, via clipboard_x11
+      # — this is what produces the `-lxcb` link error when missing) and
+      # keyboard handling (xkbcommon). Wayland and X11 windowing are loaded
+      # at runtime via dlopen, so they need no dev packages at build time.
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libxkbcommon-dev \
+            libxcb1-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev
+      - run: cargo check --workspace --all-targets
+      - run: cargo test --workspace
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libxkbcommon-dev \
+            libxcb1-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  # Dependency gate (plan §13.2): security advisories, unmaintained crates,
+  # license surprises, and untrusted sources. Config in deny.toml; run
+  # locally with `cargo deny check`. This job can start failing without a
+  # code change (a new advisory landing) — that's the point.
+  deny:
+    name: Deny (advisories, licenses)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
+  # The opt-in `video` feature links iced_video_player → GStreamer, so it needs
+  # GStreamer at build time. Compile-check it on every OS so it can't bitrot
+  # (including platform-specific breakage); the default build stays
+  # GStreamer-free.
+  video:
+    name: Video feature (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libxkbcommon-dev \
+            libxcb1-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev
+      - name: Install GStreamer
+        uses: ./.github/actions/gstreamer
+      - run: cargo clippy -p preso-app --features video --all-targets -- -D warnings

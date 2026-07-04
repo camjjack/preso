@@ -1,0 +1,97 @@
+[package]
+name = "preso-app"
+description = "preso: native markdown presentations"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[[bin]]
+name = "preso"
+path = "src/main.rs"
+
+[features]
+# wgpu is the default renderer. Build without default features to drop
+# wgpu + naga (~5 MB) for a software-only binary.
+default = ["gpu"]
+gpu = ["iced/wgpu"]
+# Inline video playback via iced_video_player (GStreamer → wgpu texture).
+# Opt-in: it needs the GStreamer system libraries installed to build and run
+# (e.g. `brew install gstreamer gst-plugins-{base,good,bad,ugly} pkg-config`).
+# Without this feature, `<!-- video: … -->` falls back to an external player.
+# Pulls in `gpu` since the player only renders under the wgpu backend.
+video = ["gpu", "dep:iced_video_player", "dep:url"]
+
+# Embeds assets/icons/preso.ico into the .exe (see build.rs). Target-keyed
+# so non-Windows builds never compile it.
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
+
+# Debian packaging (`cargo deb -p preso-app`): binary, desktop entry, and
+# hicolor icons, with shared-library Depends computed by dpkg-shlibdeps.
+[package.metadata.deb]
+name = "preso"
+section = "editors"
+priority = "optional"
+depends = "$auto"
+extended-description = """\
+A native, dual-window markdown presentation app: write your talk in a \
+single markdown file, present it with a clean audience window plus a \
+presenter view (speaker notes, timer, next-slide preview), or export it \
+to PDF. Syntax-highlighted code, Mermaid and Graphviz diagrams, LaTeX \
+math, TOML themes, and incremental reveal steps included."""
+assets = [
+    ["target/release/preso", "usr/bin/", "755"],
+    ["../../assets/linux/preso.desktop", "usr/share/applications/", "644"],
+    ["../../assets/icons/preso-16.png", "usr/share/icons/hicolor/16x16/apps/preso.png", "644"],
+    ["../../assets/icons/preso-24.png", "usr/share/icons/hicolor/24x24/apps/preso.png", "644"],
+    ["../../assets/icons/preso-32.png", "usr/share/icons/hicolor/32x32/apps/preso.png", "644"],
+    ["../../assets/icons/preso-48.png", "usr/share/icons/hicolor/48x48/apps/preso.png", "644"],
+    ["../../assets/icons/preso-64.png", "usr/share/icons/hicolor/64x64/apps/preso.png", "644"],
+    ["../../assets/icons/preso-128.png", "usr/share/icons/hicolor/128x128/apps/preso.png", "644"],
+    ["../../assets/icons/preso-256.png", "usr/share/icons/hicolor/256x256/apps/preso.png", "644"],
+    ["../../assets/icons/preso-512.png", "usr/share/icons/hicolor/512x512/apps/preso.png", "644"],
+    ["../../README.md", "usr/share/doc/preso/README.md", "644"],
+]
+
+# `cargo deb -p preso-app --variant video`: the `--features video` build,
+# packaged as `preso-video` with the GStreamer runtime in Depends. The
+# plugin packages must be listed explicitly — GStreamer loads them with
+# dlopen at run time, so $auto's link-time scan cannot see them. libav
+# supplies the common H.264/AAC decoders (mp4 clips).
+[package.metadata.deb.variants.video]
+name = "preso-video"
+features = ["video"]
+provides = "preso"
+conflicts = "preso"
+replaces = "preso"
+depends = "$auto, gstreamer1.0-plugins-base, gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-plugins-ugly, gstreamer1.0-libav"
+
+[dependencies]
+preso-core = { workspace = true }
+preso-style = { workspace = true }
+preso-diagram = { workspace = true }
+preso-export = { workspace = true }
+iced_test = "0.14"
+image = { workspace = true }
+iced = { workspace = true }
+# Inline video (opt-in `video` feature). iced_video_player needs iced built
+# with wgpu, which the `gpu`/`video` feature provides.
+iced_video_player = { version = "0.6", optional = true }
+url = { version = "2", optional = true }
+clap = { workspace = true }
+open = { workspace = true }
+notify-debouncer-full = { workspace = true }
+dirs = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+display-info = "0.5"
+# Reading font `name` tables to report which families are actually loaded
+# (already in the tree via resvg/usvg, so no extra build cost).
+ttf-parser = "0.25"
