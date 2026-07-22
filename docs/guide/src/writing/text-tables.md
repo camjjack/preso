@@ -21,6 +21,23 @@ Headings set the slide's structure: a leading `#`/`##`/`###` is the slide
 title, and its level also drives [two-column header alignment](two-columns.md)
 and [slide-kind](slide-kinds.md) styling.
 
+### Highlighted text
+
+Wrap text in `==double equals==` to draw a highlighter background behind it —
+the text keeps its normal font and colour, only the backdrop changes:
+
+```markdown
+The parser owns ==all reveal-step logic==; the renderer just draws.
+
+- Works in paragraphs, ==bullets==, headings, and table cells
+```
+
+By default the background is the theme accent at ~35% opacity; set
+[`colors.mark`](../theming/colors.md) to pick your own (it accepts
+`#rrggbbaa`, so the wash's strength is yours too). The heuristics are
+conservative: the mark must open and close on one line with no space just
+inside the `==`, so prose like `a == b` and code comparisons are left alone.
+
 ### Spacing bullets into groups
 
 A **blank line between bullets adds a gap** — no directive needed. Bullets with

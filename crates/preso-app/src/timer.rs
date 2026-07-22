@@ -44,7 +44,7 @@ impl Timer {
         }
     }
 
-    /// The talk starts at the first navigation.
+    /// Start the clock if it isn't already running (idempotent).
     pub fn start_if_needed(&mut self, now: Instant) {
         self.started.get_or_insert(now);
     }
@@ -53,8 +53,11 @@ impl Timer {
         self.started.is_some()
     }
 
-    pub fn reset(&mut self) {
-        self.started = None;
+    /// Reset to zero and keep running — a stopwatch reset (`r`), not a stop.
+    /// Leaving it running keeps the display on screen and the per-second tick
+    /// alive, instead of blanking the timer until the next navigation.
+    pub fn reset(&mut self, now: Instant) {
+        self.started = Some(now);
     }
 
     pub fn display(&self, now: Instant) -> Option<TimerDisplay> {
@@ -115,11 +118,14 @@ mod tests {
     }
 
     #[test]
-    fn reset_stops_the_timer() {
+    fn reset_restarts_from_zero() {
         let t0 = Instant::now();
         let mut t = Timer::new(None);
         t.start_if_needed(t0);
-        t.reset();
-        assert!(!t.running());
+        // Reset 100s in: still running, and counting up from the reset moment.
+        t.reset(t0 + Duration::from_secs(100));
+        assert!(t.running());
+        let d = t.display(t0 + Duration::from_secs(105)).unwrap();
+        assert_eq!(d.elapsed, "00:05");
     }
 }

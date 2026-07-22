@@ -226,6 +226,68 @@ pub enum Anchor {
     BottomRight,
 }
 
+/// A translucent callout shape drawn over an image, from a
+/// `<!-- highlight: rect x=10% y=20% w=30% h=15% -->` directive placed
+/// before the image line. Lets one master image (e.g. a protocol diagram)
+/// serve many slides, each spotlighting a different element.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Highlight {
+    pub shape: HighlightShape,
+    /// Region as fractions (`0.0`–`1.0`) of the image's rendered size, so
+    /// the same numbers hold at any display width. `x`/`y` are the top-left
+    /// corner (for an ellipse, of its bounding box).
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    /// Fill/outline color: `#hex` or a theme palette name (`accent`,
+    /// `text`, …). `None` = theme accent (fill mode) or black (spotlight).
+    /// Kept as a string so this crate stays style-agnostic, like
+    /// [`SlideOverrides`].
+    pub color: Option<String>,
+    /// Fill opacity, `0.0`–`1.0`. `0.0` with a `stroke` gives outline-only.
+    /// Defaults to `0.35`, except `1.0` in [`HighlightMode::Under`].
+    pub opacity: f32,
+    /// Outline width in design units; `0.0` = no outline.
+    pub stroke: f32,
+    /// How the shape paints relative to the image (`mode=` or a bare
+    /// `spotlight`/`under` flag).
+    pub mode: HighlightMode,
+    /// `clip` flag: confine a [`HighlightMode::Fill`] or
+    /// [`HighlightMode::Spotlight`] wash to the image's opaque pixels, so a
+    /// transparent image's see-through areas (and the slide background
+    /// showing through them) are left untouched. No effect on `under`.
+    pub clip: bool,
+    /// `None` = always visible; `Some(n)` (from `highlight[n]:`) shows the
+    /// shape from reveal step `n` on, like `note[n]`.
+    pub step: Option<usize>,
+}
+
+/// How a [`Highlight`] paints relative to its image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HighlightMode {
+    /// Translucent shape drawn over the region.
+    #[default]
+    Fill,
+    /// Inverted: dim everything on the image *except* the region, which
+    /// stays at full fidelity. Several spotlight shapes on one image punch
+    /// holes in a single scrim.
+    Spotlight,
+    /// Solid shape drawn *under* the image. For images with transparency
+    /// the color shows through the clear pixels — a marker stroke behind
+    /// the ink — without touching the opaque artwork at all.
+    Under,
+}
+
+/// Shape of a [`Highlight`] region.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HighlightShape {
+    #[default]
+    Rect,
+    /// Inscribed in the `x`/`y`/`w`/`h` bounding box.
+    Ellipse,
+}
+
 /// Slide layout, from `<!-- layout: Name -->`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Layout {
@@ -352,6 +414,11 @@ pub struct Slide {
     pub image_rows: Vec<ImageRow>,
     /// Decoration images placed below the content layer (`<!-- image: … -->`).
     pub layer_images: Vec<LayerImage>,
+    /// Highlight groups (`<!-- highlight: … -->`), one per annotated image.
+    /// The parser ties an image to its group by appending an `hl:<index>`
+    /// token to the image's `#preso-img=` URL fragment; indices are
+    /// slide-global, so they stay valid in two-column sub-slides.
+    pub highlights: Vec<Vec<Highlight>>,
     /// Layout directive for this slide.
     pub layout: Layout,
     /// Per-slide style overrides.
@@ -402,6 +469,9 @@ impl Slide {
             let end = (next + sub.code_blocks.len()).min(self.code_blocks.len());
             sub.code_blocks = self.code_blocks[next..end].to_vec();
             next = end;
+            // `hl:` fragment tokens in the column source index the parent's
+            // highlight groups (slide-global), so each column carries them all.
+            sub.highlights = self.highlights.clone();
             sub
         };
         let left = build(&left_src);
@@ -422,7 +492,16 @@ impl Slide {
             .map(CodeBlock::stage_count)
             .max()
             .unwrap_or(1);
-        self.steps.len().max(code_stages)
+        // Step-gated highlights (`highlight[n]:`) extend the count the same
+        // way, so a slide can click through them without explicit pauses.
+        let highlight_stages = self
+            .highlights
+            .iter()
+            .flatten()
+            .filter_map(|h| h.step)
+            .max()
+            .map_or(1, |s| s + 1);
+        self.steps.len().max(code_stages).max(highlight_stages)
     }
 
     /// Markdown to render at the given step (clamped).

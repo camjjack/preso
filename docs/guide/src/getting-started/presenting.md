@@ -20,7 +20,8 @@ The presenter view shows, around the current slide:
 - **Speaker notes** — the notes attached to the current slide (and any
   step-specific notes for the current step). See
   [Speaker Notes](../writing/reveal-steps.md).
-- **Timer** — elapsed time since you started. Press <kbd>r</kbd> to reset it.
+- **Timer** — elapsed time. It starts counting as soon as preso opens; press
+  <kbd>r</kbd> at the real start of your talk to zero it (it keeps running).
 - A **problem banner** — if the deck fails to parse on reload, the presenter
   view shows the error so you can fix it without losing your place.
 

@@ -9,15 +9,32 @@
 //! chapter file can carry its own (for standalone preview) without polluting
 //! the master deck.
 
+use crate::fence;
 use std::path::{Path, PathBuf};
+use thiserror::Error;
 
 /// Guards against pathological nesting even if cycle detection is somehow
 /// evaded (e.g. via symlinks that don't canonicalize equal).
 const MAX_DEPTH: usize = 32;
 
+#[derive(Debug, Error)]
+pub enum IncludeError {
+    #[error("cannot include {path}: {source}")]
+    Read {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+
+    #[error("circular include: {path}")]
+    Circular { path: PathBuf },
+
+    #[error("include nesting too deep (cyclic include?)")]
+    TooDeep,
+}
+
 /// Expand every `<!-- include: … -->` directive in `source`, resolving paths
 /// relative to `base_dir`. Returns the combined markdown.
-pub fn expand(source: &str, base_dir: &Path) -> anyhow::Result<String> {
+pub fn expand(source: &str, base_dir: &Path) -> Result<String, IncludeError> {
     let mut stack = Vec::new();
     expand_inner(source, base_dir, &mut stack, 0)
 }
@@ -27,14 +44,13 @@ fn expand_inner(
     dir: &Path,
     stack: &mut Vec<PathBuf>,
     depth: usize,
-) -> anyhow::Result<String> {
-    anyhow::ensure!(
-        depth <= MAX_DEPTH,
-        "include nesting too deep (cyclic include?)"
-    );
+) -> Result<String, IncludeError> {
+    if depth > MAX_DEPTH {
+        return Err(IncludeError::TooDeep);
+    }
 
     let mut out = String::new();
-    let mut fence = preso_core::fence::Tracker::default();
+    let mut fence = fence::Tracker::default();
     for line in source.lines() {
         // Inside a fence, everything is literal — including `<!-- include -->`.
         if fence.process(line) {
@@ -46,14 +62,14 @@ fn expand_inner(
         if let Some(rel) = parse_include(line.trim()) {
             let path = dir.join(rel);
             let canon = path.canonicalize().unwrap_or_else(|_| path.clone());
-            anyhow::ensure!(
-                !stack.contains(&canon),
-                "circular include: {}",
-                path.display()
-            );
+            if stack.contains(&canon) {
+                return Err(IncludeError::Circular { path });
+            }
 
-            let child = std::fs::read_to_string(&path)
-                .map_err(|e| anyhow::anyhow!("cannot include {}: {e}", path.display()))?;
+            let child = std::fs::read_to_string(&path).map_err(|source| IncludeError::Read {
+                path: path.clone(),
+                source,
+            })?;
             let body = strip_frontmatter(&child);
             let child_dir = path.parent().unwrap_or(dir);
 
@@ -151,7 +167,7 @@ mod tests {
         fs::write(dir.join("x.md"), "# X\n\n<!-- include: y.md -->\n").unwrap();
         fs::write(dir.join("y.md"), "# Y\n\n<!-- include: x.md -->\n").unwrap();
         let err = expand("<!-- include: x.md -->\n", &dir).unwrap_err();
-        assert!(err.to_string().contains("circular"), "got: {err}");
+        assert!(matches!(err, IncludeError::Circular { .. }), "got: {err}");
     }
 
     #[test]

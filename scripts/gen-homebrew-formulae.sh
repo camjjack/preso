@@ -98,18 +98,27 @@ class PresoVideo < Formula
   end
 
   depends_on "gstreamer"
+  # GStreamer pulls these in, but their dylibs live in their own kegs and
+  # the binary references them by @rpath, so each needs an rpath below.
+  depends_on "glib"    # libgobject-2.0, libglib-2.0, libgio-2.0
+  depends_on "gettext" # libintl.8 (keg-only, not in HOMEBREW_PREFIX/lib)
 
   conflicts_with "preso", because: "both install a \`preso\` binary"
 
   def install
     bin.install "preso"
     if OS.mac?
-      # The release binary links GStreamer through upstream's
-      # @rpath/libgst*.dylib install names but ships no LC_RPATH of its
-      # own; point it at brew's GStreamer. Editing load commands
-      # invalidates the ad-hoc signature on Apple Silicon, so re-sign.
-      system "install_name_tool", "-add_rpath",
-             Formula["gstreamer"].opt_lib.to_s, bin/"preso"
+      # The release binary links GStreamer (and its glib/gettext deps)
+      # through upstream's @rpath/lib*.dylib install names but ships no
+      # LC_RPATH of its own. The libraries are split across kegs —
+      # libgst*.dylib in gstreamer, libgobject/libglib/libgio in glib,
+      # libintl in gettext — so add an rpath for each. Editing load
+      # commands invalidates the ad-hoc signature on Apple Silicon, so
+      # re-sign afterwards.
+      ["gstreamer", "glib", "gettext"].each do |dep|
+        system "install_name_tool", "-add_rpath",
+               Formula[dep].opt_lib.to_s, bin/"preso"
+      end
       system "codesign", "--force", "--sign", "-", bin/"preso"
     else
       # Linuxbrew's GStreamer lives outside the default loader paths.

@@ -66,21 +66,19 @@ mod embed {
     use iced_video_player::Video;
     use std::path::Path;
 
-    /// A GStreamer-backed video bound to a slide, for inline playback under the
-    /// wgpu backend. Owns the pipeline; dropping it tears the pipeline down.
+    /// A GStreamer-backed video clip, for inline playback under the wgpu
+    /// backend. Owns the pipeline; dropping it tears the pipeline down. The
+    /// app keys these by deck-relative path in a map.
     pub struct Embedded {
-        /// Deck-relative path it was loaded from, so the app can tell when the
-        /// current slide's video changed and rebuild.
-        path: String,
         video: Video,
     }
 
     impl Embedded {
-        /// Load the clip at `path` for the slide referencing it as `rel`
-        /// (deck-relative). Starts **paused** — playback begins when the
-        /// presenter presses `V` — so entering a video slide doesn't blast
-        /// audio unprompted.
-        pub fn load(rel: String, path: &Path) -> Result<Self, String> {
+        /// Load (and preroll) the clip at `path`. Starts **paused** — playback
+        /// begins when the presenter presses `V` — so entering a video slide
+        /// doesn't blast audio unprompted. This blocks on the GStreamer preroll
+        /// (why the app calls it up front, off the presentation path).
+        pub fn load(path: &Path) -> Result<Self, String> {
             // `Url::from_file_path` demands an absolute path; the deck path can
             // be relative (e.g. `preso deck.md`), so resolve it first. This
             // also surfaces a missing file as a clear error.
@@ -89,12 +87,7 @@ mod embed {
                 .map_err(|()| format!("invalid video path: {}", absolute.display()))?;
             let mut video = Video::new(&url).map_err(|e| e.to_string())?;
             video.set_paused(true);
-            Ok(Self { path: rel, video })
-        }
-
-        /// The deck-relative path this was loaded from.
-        pub fn path(&self) -> &str {
-            &self.path
+            Ok(Self { video })
         }
 
         /// The underlying player, for the `VideoPlayer` widget.
@@ -105,6 +98,27 @@ mod embed {
         /// Toggle play/pause.
         pub fn toggle_pause(&mut self) {
             self.video.set_paused(!self.video.paused());
+        }
+
+        /// Pause the clip if it's playing (idempotent). Used when its slide
+        /// leaves the screen so it stops without being torn down.
+        pub fn pause(&mut self) {
+            if !self.video.paused() {
+                self.video.set_paused(true);
+            }
+        }
+
+        /// Seek backwards: `to_start` jumps to the beginning (full rewind),
+        /// otherwise scrubs back a fixed step, clamped at zero. A failed seek
+        /// (e.g. a non-seekable source) is ignored — nothing to do about it.
+        pub fn seek_back(&mut self, to_start: bool) {
+            const SCRUB: std::time::Duration = std::time::Duration::from_secs(5);
+            let target = if to_start {
+                std::time::Duration::ZERO
+            } else {
+                self.video.position().saturating_sub(SCRUB)
+            };
+            let _ = self.video.seek(target, false);
         }
     }
 }

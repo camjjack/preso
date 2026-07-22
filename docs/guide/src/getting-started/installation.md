@@ -3,6 +3,32 @@
 preso is a single self-contained binary — fonts and the built-in themes are
 baked in, so there's nothing else to install alongside it.
 
+## Homebrew (macOS & Linux) — recommended
+
+On macOS (Apple Silicon) and Linux (x86_64), the easiest way to install preso
+is from its Homebrew [tap](https://github.com/camjjack/homebrew-preso). A tap is
+a third-party formula repository, so you add — and thereby trust — it once, then
+install from it:
+
+```sh
+brew tap camjjack/preso     # one-time: add & trust the preso tap
+brew install preso          # …or: brew install preso-video  (inline video)
+```
+
+`brew install camjjack/preso/preso` does both at once (the qualified name taps
+implicitly). A few notes:
+
+- **`preso-video`** compiles in [inline video](../writing/video.md) and declares
+  GStreamer as a Homebrew dependency, so `brew` installs it for you — nothing
+  else to set up for playback. `preso` and `preso-video` both provide the
+  `preso` command, so install one or the other.
+- **Coverage:** macOS is Apple Silicon only; Linux is x86_64 via
+  [Linuxbrew](https://docs.brew.sh/Homebrew-on-Linux). On Windows, use a
+  prebuilt binary or build from source.
+
+Upgrade later with `brew upgrade preso` (or `preso-video`) — keeping the tap is
+what lets `brew` find new releases.
+
 ## Prebuilt binaries
 
 Download the archive for your platform from the
@@ -22,9 +48,11 @@ sudo mv preso-*/preso /usr/local/bin/
 preso --version
 ```
 
-> 💡 **macOS Gatekeeper.** The binaries aren't notarized, so the first launch
-> may be blocked. Right-click the binary → **Open**, or clear the quarantine
-> flag with `xattr -d com.apple.quarantine /usr/local/bin/preso`.
+> 💡 **macOS Gatekeeper.** These manually-downloaded binaries aren't notarized,
+> so the first launch may be blocked. Right-click the binary → **Open**, or
+> clear the quarantine flag with
+> `xattr -d com.apple.quarantine /usr/local/bin/preso`. (A Homebrew install
+> avoids this — see above.)
 
 ## Build from source
 

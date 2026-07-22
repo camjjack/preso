@@ -6,6 +6,9 @@
 //! whichever is smaller. The PDF is built directly with `lopdf` because
 //! higher-level writers only allow one codec for the whole document.
 
+mod pptx;
+pub use pptx::write_pptx;
+
 use lopdf::content::{Content, Operation};
 use lopdf::{Dictionary, Document, Object, ObjectId, Stream, StringFormat};
 use std::io::Write;
@@ -200,7 +203,7 @@ fn encode_image(page: &Page, quality: f32) -> (Vec<u8>, &'static str) {
 }
 
 /// Drop the (opaque) alpha channel: PDF DeviceRGB images are 3 bytes/pixel.
-fn rgba_to_rgb(rgba: &[u8]) -> Vec<u8> {
+pub(crate) fn rgba_to_rgb(rgba: &[u8]) -> Vec<u8> {
     let mut rgb = Vec::with_capacity(rgba.len() / 4 * 3);
     for px in rgba.chunks_exact(4) {
         rgb.extend_from_slice(&px[..3]);

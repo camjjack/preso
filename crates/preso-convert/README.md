@@ -1,17 +1,35 @@
 # preso-convert
 
 Convert a [Slidev](https://sli.dev) deck or a PowerPoint (`.pptx`) file into
-preso markdown. The importer is chosen from the input's extension.
+preso markdown — or export a preso deck back out to Slidev or editable
+PowerPoint. The importer is
+chosen from the input's extension; `--to` selects an exporter instead.
 
 ```sh
 preso-convert talk.md -o talk.preso.md     # write to a file
 preso-convert talk.md                       # or to stdout
 preso-convert talk.md -o out.md --force     # overwrite existing
 preso-convert deck.pptx -o talk.md          # PowerPoint → preso
+preso-convert talk.md --to slidev -o slides.md   # preso → Slidev
+preso-convert talk.md --to pptx -o talk.pptx      # preso → editable PowerPoint
 ```
 
-Anything that can't be represented in preso is reported as a warning on
-stderr (silence with `--quiet`); the conversion always produces output.
+Anything that can't be represented in the target format is reported as a
+warning on stderr (silence with `--quiet`); the conversion always produces
+output. The Slidev exporter assembles `<!-- include: … -->` chapters first,
+passes content (code line-highlights, math, Mermaid share Slidev's syntax)
+through unchanged, and maps directives: slide kinds → `layout: cover` /
+`section`, TwoColumn + `***` → `two-cols` + `::right::`, reveal steps →
+`<v-click>`, notes → Slidev's trailing-comment notes. preso-only styling
+(themes, image framing, footnotes, layer decorations) is dropped with
+warnings.
+
+`--to pptx` produces *editable* PowerPoint (contrast `preso --export-pptx`,
+which is pixel-faithful pictures): headings/paragraphs/bullets become text
+runs, tables become PowerPoint tables, notes become notes pages, images
+embed, and math/Mermaid/Graphviz render to embedded PNGs. Slides are plain
+(themes don't translate), and PowerPoint has no flow layout, so block
+positions are estimated — expect to nudge things after a handoff.
 
 ## From Slidev: what converts
 

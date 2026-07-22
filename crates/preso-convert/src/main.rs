@@ -1,4 +1,5 @@
-//! `preso-convert` — turn a Slidev deck or PowerPoint file into preso markdown.
+//! `preso-convert` — turn a Slidev deck or PowerPoint file into preso
+//! markdown, or export a preso deck back out (`--to slidev`).
 
 use anyhow::Context as _;
 use clap::Parser;
@@ -9,15 +10,23 @@ use std::path::PathBuf;
 #[command(
     name = "preso-convert",
     version,
-    about = "Convert a Slidev deck or PowerPoint (.pptx) file to preso markdown"
+    about = "Convert a Slidev deck or PowerPoint (.pptx) file to preso markdown, \
+             or a preso deck to Slidev (--to slidev)"
 )]
 struct Cli {
-    /// Slidev markdown or PowerPoint (.pptx) file to convert
+    /// Slidev markdown or PowerPoint (.pptx) file to convert — or, with
+    /// --to, the preso deck to export
     input: PathBuf,
 
     /// Output file (defaults to stdout)
     #[arg(short, long)]
     output: Option<PathBuf>,
+
+    /// Export instead of import: convert a preso deck *to* this format.
+    /// Supported: slidev (markdown), pptx (editable PowerPoint — text
+    /// boxes, tables, notes; math/diagrams embedded as images)
+    #[arg(long, value_name = "FORMAT")]
+    to: Option<String>,
 
     /// Overwrite the output file if it already exists
     #[arg(short, long)]
@@ -38,7 +47,48 @@ fn main() -> anyhow::Result<()> {
         .extension()
         .is_some_and(|e| e.eq_ignore_ascii_case("pptx"));
 
-    let result = if is_pptx {
+    let result = if let Some(format) = cli.to.as_deref() {
+        anyhow::ensure!(
+            matches!(format, "slidev" | "pptx"),
+            "unknown --to format {format:?} (supported: slidev, pptx)"
+        );
+        anyhow::ensure!(
+            !is_pptx,
+            "--to exports a *preso* markdown deck, not a .pptx"
+        );
+        let source = std::fs::read_to_string(&cli.input)
+            .with_context(|| format!("cannot read {}", cli.input.display()))?;
+        // Export the assembled deck: chapter files pulled in with
+        // `<!-- include: … -->` are spliced first, exactly as preso would.
+        let dir = cli.input.parent().unwrap_or(std::path::Path::new("."));
+        let source = preso_core::include::expand(&source, dir)?;
+        if format == "pptx" {
+            // Binary output: stdout is not an option.
+            let out = cli
+                .output
+                .as_ref()
+                .context("--to pptx writes a binary file; pass -o <file>")?;
+            anyhow::ensure!(
+                cli.force || !out.exists(),
+                "{} already exists (use --force to overwrite)",
+                out.display()
+            );
+            let export = preso_convert::export_pptx(&source, dir)?;
+            std::fs::write(out, &export.bytes)
+                .with_context(|| format!("cannot write {}", out.display()))?;
+            if !cli.quiet {
+                if !export.warnings.is_empty() {
+                    eprintln!("{} conversion warning(s):", export.warnings.len());
+                    for warning in &export.warnings {
+                        eprintln!("  - {warning}");
+                    }
+                }
+                eprintln!("wrote {}", out.display());
+            }
+            return Ok(());
+        }
+        preso_convert::export_slidev(&source)?
+    } else if is_pptx {
         // Images are extracted into `<output-stem>.assets/` beside the output;
         // with no output file (stdout) there's nowhere to put them.
         let assets = cli.output.as_deref().and_then(assets_dir);

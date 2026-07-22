@@ -7,7 +7,7 @@
 A native markdown presentation app, written in Rust. Write your talk in a
 single markdown file; present it in a dual-window setup (a clean **audience**
 window plus a **presenter** view with notes, timer, and a preview of what's
-next), or export it to PDF.
+next), or export it to PDF or PowerPoint.
 
 No browser, no Electron, no network. Slides render on the GPU (wgpu) by
 default, with a software rasterizer (tiny-skia) fallback via `--software` for
@@ -37,21 +37,69 @@ machines where the GPU backend misbehaves.
 - **Video** — mark a slide with `<!-- video: clip.mp4 -->`; plays inline on the
   slide with the `video` feature (GStreamer), or via a fullscreen external
   player otherwise.
-- **PDF export** — one page per slide, one page per reveal step, or a 2-up
+- **PDF & PowerPoint export** — one page per slide, one page per reveal step, or a 2-up
   handout layout. Fully headless (no window opened).
 
-## Install / build
+## Installation
+
+### Homebrew (macOS & Linux) — recommended
+
+On **macOS** (Apple Silicon) and **Linux** (x86_64), Homebrew is the easiest
+way to install and keep preso up to date. preso lives in its own
+[tap](https://github.com/camjjack/homebrew-preso) — a third-party formula
+repository — so you add (and thereby trust) that repository once, then install
+from it:
+
+```sh
+brew tap camjjack/preso     # one-time: add & trust the preso tap
+brew install preso          # the standard binary
+```
+
+For inline video playback (the `video` feature), install `preso-video`
+instead — it pulls in GStreamer for you:
+
+```sh
+brew install preso-video    # inline video; GStreamer installed automatically
+```
+
+(`preso` and `preso-video` both provide the `preso` command, so install one or
+the other.) The tap-then-install can also be a single qualified command, which
+adds the tap implicitly:
+
+```sh
+brew install camjjack/preso/preso        # or: camjjack/preso/preso-video
+```
+
+A few things worth knowing the first time:
+
+- **You're adding a third-party tap.** `brew tap` registers an external
+  repository with Homebrew — a one-time trust step, since Homebrew runs its
+  formulae. Keep it tapped: it's also how `brew upgrade` finds new preso
+  releases.
+- **`preso-video` sets up GStreamer for you.** It declares GStreamer (and its
+  glib/gettext libraries) as Homebrew dependencies, so `brew` installs them
+  alongside — nothing else to configure for inline video. Plain `preso` has no
+  such dependency.
+- **Platform coverage.** macOS is Apple Silicon only (there are no Intel
+  release builds); Linux is x86_64 via
+  [Linuxbrew](https://docs.brew.sh/Homebrew-on-Linux). On **Windows**, use a
+  prebuilt binary or build from source (below).
+
+Upgrade later with `brew upgrade preso` (or `preso-video`).
+
+### Prebuilt binaries (all platforms)
 
 Prebuilt binaries for macOS (Apple Silicon), Linux (x86_64), and Windows
 (x86_64) are attached to each tagged release on the
 [Releases page](https://github.com/camjjack/preso/releases). The binary is
 self-contained (fonts and the built-in themes are embedded), so just unpack
-and run it.
+and run it. This is the route for Windows, and for anyone not using Homebrew.
 
 Each release also ships a `-video` variant with inline video playback compiled
 in (the `video` feature). Those link GStreamer, so they need it installed at run
-time — see [Video](#video) for the per-platform install. The plain binaries have
-no such dependency and fall back to an external player for video slides.
+time — see [Video](#video) for the per-platform install. (Installing via
+`brew install preso-video` handles that for you.) The plain binaries have no
+such dependency and fall back to an external player for video slides.
 
 ### Nix
 
@@ -182,7 +230,9 @@ on the build:
 
 Inline playback decodes via GStreamer, so a `video` build needs the GStreamer
 runtime installed to **build and run** — including for the prebuilt `-video`
-binaries:
+binaries. (Installing with `brew install preso-video` is the exception: it
+declares GStreamer as a dependency, so Homebrew sets it up automatically and
+you can skip this section.) Otherwise, per platform:
 
 - **macOS** — `brew install gstreamer` (or the official framework from
   [gstreamer.freedesktop.org](https://gstreamer.freedesktop.org/download/)).
@@ -254,7 +304,7 @@ theme.
 | `preso-core` | Markdown deck parser and document model |
 | `preso-style` | TOML theme model and the built-in themes |
 | `preso-diagram` | Mermaid / Graphviz / LaTeX-math rendering to images |
-| `preso-export` | PDF page assembly |
+| `preso-export` | PDF and bitmap-PPTX assembly |
 | `preso-app` | The `preso` binary: iced GUI, presenter view, PDF export |
 
 ## License

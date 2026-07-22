@@ -1,16 +1,22 @@
-//! Convert a Slidev deck or PowerPoint file into preso markdown.
+//! Convert between preso markdown and other presentation formats.
 //!
-//! [`convert`] parses a Slidev source, maps deck headmatter to preso
-//! frontmatter, then runs each slide through the [`rules`] pipeline and
-//! renders the result. [`convert_pptx`] reads a `.pptx` directly. Anything
-//! that can't be represented in preso is reported as a warning rather than
-//! failing the conversion.
+//! Importing: [`convert`] parses a Slidev source, maps deck headmatter to
+//! preso frontmatter, then runs each slide through the [`rules`] pipeline
+//! and renders the result; [`convert_pptx`] reads a `.pptx` directly.
+//! Exporting: [`export_slidev`] goes the other way, turning a preso deck
+//! into Slidev markdown. In every direction, anything that can't be
+//! represented in the target is reported as a warning rather than failing
+//! the conversion.
 
 mod pptx;
+mod pptx_export;
 mod rules;
 mod slidev;
+mod slidev_export;
 
 pub use pptx::convert as convert_pptx;
+pub use pptx_export::{PptxExport, export as export_pptx};
+pub use slidev_export::export as export_slidev;
 
 use rules::{DECK_KEYS, SlideCtx, as_string, default_rules};
 use serde_norway::{Mapping, Value};
@@ -169,7 +175,7 @@ fn aspect_to_preso(value: &Value) -> Option<String> {
 
 /// Quote a YAML scalar if it contains characters that would break a bare
 /// `key: value` line.
-fn yaml_scalar(s: &str) -> String {
+pub(crate) fn yaml_scalar(s: &str) -> String {
     let needs_quotes = s.is_empty()
         || s.starts_with([
             ' ', '#', '"', '\'', '-', '[', '{', '*', '&', '!', '|', '>', '@', '`',

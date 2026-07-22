@@ -35,6 +35,13 @@ enum Key {
         path: String,
         px: u32,
     },
+    /// A slide image with highlight washes composited into its pixels
+    /// (see [`Media::masked_image`]); `ops` is a hash of the applied ops.
+    MaskedImage {
+        path: String,
+        px: u32,
+        ops: u64,
+    },
     Gradient {
         from: (u8, u8, u8, u8),
         to: (u8, u8, u8, u8),
@@ -254,6 +261,78 @@ impl Media {
         })
     }
 
+    /// Like [`Self::slide_image`], but with the highlight `ops` composited
+    /// into the pixels — respecting the image's alpha, so a transparent
+    /// image's see-through areas stay untouched (the slide background
+    /// showing through them is unaffected). This is what a `clip` highlight
+    /// needs: iced's canvas can't mask a scrim by an arbitrary alpha
+    /// channel, so we bake the wash into the pixels instead. Cached by
+    /// `(path, px, ops)`; unsupported for remote and animated-GIF images
+    /// (returns `None`, so the caller falls back to the canvas overlay).
+    pub fn masked_image(&self, url: &str, target_width: Option<f32>, ops: &[MaskOp]) -> Entry {
+        use std::hash::{Hash, Hasher};
+        if ops.is_empty() {
+            return None;
+        }
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for op in ops {
+            op.hash(&mut hasher);
+        }
+        let key = Key::MaskedImage {
+            path: url.to_string(),
+            px: target_width.map_or(0, |w| w.round() as u32),
+            ops: hasher.finish(),
+        };
+        self.lookup(key, || {
+            let (mut rgba, w, h, logical) = self.decode_rgba(url, target_width)?;
+            composite_mask(&mut rgba, w, h, ops);
+            Some((image::Handle::from_rgba(w, h, rgba), logical))
+        })
+    }
+
+    /// Decode a slide image to raw RGBA at the resolution [`Self::slide_image`]
+    /// would use, plus the logical display size. SVGs rasterize (oversampled
+    /// for hidpi); bitmaps decode to natural pixels. `None` for remote,
+    /// missing, or undecodable files.
+    fn decode_rgba(
+        &self,
+        url: &str,
+        target_width: Option<f32>,
+    ) -> Option<(Vec<u8>, u32, u32, Size)> {
+        if url.contains("://") {
+            return None;
+        }
+        let path = self.base_dir.borrow().join(url);
+        if !path.is_file() {
+            return None;
+        }
+        if path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("svg"))
+        {
+            let svg = std::fs::read_to_string(&path).ok()?;
+            let scale = match target_width {
+                Some(width) => {
+                    let (intrinsic_w, _) = self.renderer.svg_size(&svg).ok()?;
+                    (width / intrinsic_w) * OVERSAMPLE
+                }
+                None => OVERSAMPLE,
+            };
+            let raster = self.renderer.rasterize(&svg, scale).ok()?;
+            let logical = Size::new(
+                raster.width as f32 / OVERSAMPLE,
+                raster.height as f32 / OVERSAMPLE,
+            );
+            Some((raster.rgba, raster.width, raster.height, logical))
+        } else {
+            let bytes = std::fs::read(&path).ok()?;
+            let img = ::image::load_from_memory(&bytes).ok()?;
+            let rgba = img.to_rgba8();
+            let (w, h) = (rgba.width(), rgba.height());
+            Some((rgba.into_raw(), w, h, Size::new(w as f32, h as f32)))
+        }
+    }
+
     /// Soft cap on cached entries. Renders are content-keyed, so a talk
     /// rarely exceeds a few dozen; the cap only matters during long
     /// hot-reload editing sessions with churning content.
@@ -349,6 +428,92 @@ fn base_dir_of(deck_path: &std::path::Path) -> PathBuf {
 /// path and let it decode lazily (cheap, low-memory); otherwise decode here by
 /// content into RGBA, which always rasterises. A file that isn't a decodable
 /// image is skipped (the caller shows its alt text) rather than crashing.
+/// One highlight wash to composite into an image's pixels (see
+/// [`Media::masked_image`]). Coordinates are fractions of the image.
+#[derive(Debug, Clone, Copy)]
+pub struct MaskOp {
+    pub ellipse: bool,
+    /// `true` = spotlight scrim (dim *outside* the region); `false` = fill
+    /// (tint *inside* the region).
+    pub spotlight: bool,
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    pub color: (u8, u8, u8),
+    /// Blend strength, `0.0`–`1.0`.
+    pub alpha: f32,
+}
+
+impl std::hash::Hash for MaskOp {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        // Quantize the floats so the op is `Hash` (for the cache key) and
+        // sub-pixel jitter doesn't mint new cache entries.
+        self.ellipse.hash(state);
+        self.spotlight.hash(state);
+        for f in [self.x, self.y, self.w, self.h, self.alpha] {
+            ((f * 4096.0).round() as i32).hash(state);
+        }
+        self.color.hash(state);
+    }
+}
+
+impl MaskOp {
+    /// Whether the region contains the point at image-fraction `(fx, fy)`.
+    fn contains(&self, fx: f32, fy: f32) -> bool {
+        if self.ellipse {
+            let (cx, cy) = (self.x + self.w / 2.0, self.y + self.h / 2.0);
+            let (rx, ry) = (self.w / 2.0, self.h / 2.0);
+            if rx <= 0.0 || ry <= 0.0 {
+                return false;
+            }
+            let (dx, dy) = ((fx - cx) / rx, (fy - cy) / ry);
+            dx * dx + dy * dy <= 1.0
+        } else {
+            fx >= self.x && fx < self.x + self.w && fy >= self.y && fy < self.y + self.h
+        }
+    }
+}
+
+/// Blend the highlight `ops` into `rgba` (`w`×`h`, straight-alpha RGBA8),
+/// leaving each pixel's alpha untouched — so fully transparent areas stay
+/// transparent and the slide background behind them is unaffected.
+/// Spotlight ops dim everything outside the union of their regions (styled
+/// by the first one); fill ops tint their region. Spotlight is applied
+/// first, then fills paint on top.
+fn composite_mask(rgba: &mut [u8], w: u32, h: u32, ops: &[MaskOp]) {
+    let spots: Vec<&MaskOp> = ops.iter().filter(|o| o.spotlight).collect();
+    let fills: Vec<&MaskOp> = ops.iter().filter(|o| !o.spotlight).collect();
+    let scrim = spots.first();
+    let blend = |chan: &mut u8, target: u8, a: f32| {
+        *chan = (f32::from(*chan) * (1.0 - a) + f32::from(target) * a).round() as u8;
+    };
+    for py in 0..h {
+        for px in 0..w {
+            let idx = ((py * w + px) * 4) as usize;
+            if rgba[idx + 3] == 0 {
+                continue; // transparent: leave it (background shows through)
+            }
+            let fx = (px as f32 + 0.5) / w as f32;
+            let fy = (py as f32 + 0.5) / h as f32;
+            if let Some(s) = scrim
+                && !spots.iter().any(|o| o.contains(fx, fy))
+            {
+                blend(&mut rgba[idx], s.color.0, s.alpha);
+                blend(&mut rgba[idx + 1], s.color.1, s.alpha);
+                blend(&mut rgba[idx + 2], s.color.2, s.alpha);
+            }
+            for o in &fills {
+                if o.contains(fx, fy) {
+                    blend(&mut rgba[idx], o.color.0, o.alpha);
+                    blend(&mut rgba[idx + 1], o.color.1, o.alpha);
+                    blend(&mut rgba[idx + 2], o.color.2, o.alpha);
+                }
+            }
+        }
+    }
+}
+
 fn load_bitmap(path: &std::path::Path) -> Entry {
     let content_format = image_header(path).and_then(|h| ::image::guess_format(&h).ok());
     let ext_format = ::image::ImageFormat::from_path(path).ok();
@@ -471,6 +636,43 @@ mod tests {
             to: preso_style::Color::rgb(0x2c, 0x53, 0x64),
             angle,
         }
+    }
+
+    #[test]
+    fn composite_mask_preserves_alpha_and_dims_only_outside() {
+        // 2x1 image: left pixel opaque red, right pixel transparent.
+        let mut rgba = vec![255, 0, 0, 255, 0, 0, 0, 0];
+        // Spotlight the right half with an opaque black scrim: the left
+        // (opaque) pixel is outside → dims to black; the right (transparent)
+        // pixel keeps alpha 0, so the slide background stays untouched.
+        let op = MaskOp {
+            ellipse: false,
+            spotlight: true,
+            x: 0.5,
+            y: 0.0,
+            w: 0.5,
+            h: 1.0,
+            color: (0, 0, 0),
+            alpha: 1.0,
+        };
+        composite_mask(&mut rgba, 2, 1, &[op]);
+        assert_eq!(rgba, vec![0, 0, 0, 255, 0, 0, 0, 0]);
+
+        // A fill over the whole width tints only the opaque pixel; the
+        // transparent one is skipped (alpha stays 0).
+        let mut rgba = vec![200, 200, 200, 255, 9, 9, 9, 0];
+        let op = MaskOp {
+            ellipse: false,
+            spotlight: false,
+            x: 0.0,
+            y: 0.0,
+            w: 1.0,
+            h: 1.0,
+            color: (0, 0, 255),
+            alpha: 0.5,
+        };
+        composite_mask(&mut rgba, 2, 1, &[op]);
+        assert_eq!(rgba, vec![100, 100, 228, 255, 9, 9, 9, 0]);
     }
 
     #[test]

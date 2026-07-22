@@ -63,6 +63,10 @@ pub struct Palette {
     pub link: Color,
     pub muted: Color,
     pub code_background: Color,
+    /// Background of `==marked==` text. Accepts `#rrggbbaa` for a
+    /// translucent wash; `None` = the renderer derives one from `accent`.
+    #[serde(default)]
+    pub mark: Option<Color>,
 }
 
 /// Font sizes in design units (1920×1080 canvas), plus optional families.
@@ -668,6 +672,8 @@ pub struct PaletteOverlay {
     pub muted: Option<Color>,
     #[serde(default)]
     pub code_background: Option<Color>,
+    #[serde(default)]
+    pub mark: Option<Color>,
 }
 
 /// No `files` here: font files load once at startup from the base theme.
@@ -750,6 +756,7 @@ impl ThemeOverlay {
 
         merge!(copy: self.colors => theme.colors;
             background, text, heading, accent, link, muted, code_background);
+        merge!(opt: self.colors => theme.colors; mark);
 
         merge!(copy: self.fonts => theme.fonts;
             body_size, h1_size, h2_size, h3_size, code_size);

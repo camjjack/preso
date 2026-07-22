@@ -121,3 +121,40 @@ preso talk.md
 The converter is built as an extensible rule pipeline; see its
 [README](https://github.com/camjjack/preso/blob/main/crates/preso-convert/README.md)
 to add mappings.
+
+## Leaving preso (exporting to Slidev or PowerPoint)
+
+Migration works in reverse too, so adopting preso isn't a one-way door:
+
+```sh
+preso-convert talk.md --to slidev -o slides.md
+```
+
+`<!-- include: … -->` chapters are assembled first, so the whole deck
+exports. Content carries over cleanly — code line-highlights (`{2,4-6}`,
+`{1|2|3}`), math, and Mermaid use the same syntax in Slidev; slide kinds
+become `layout: cover` / `layout: section`, two-column slides become
+`layout: two-cols` with `::right::`, reveal steps become `<v-click>`
+blocks, and speaker notes become Slidev's trailing-comment notes.
+preso-only styling (themes, image framing, footnotes, layer decorations)
+has no Slidev equivalent and is dropped — each drop is reported as a
+warning, like the import direction.
+
+For an **editable PowerPoint** (text boxes, real tables, notes pages —
+for people who will edit the deck in PowerPoint):
+
+```sh
+preso-convert talk.md --to pptx -o talk.pptx
+```
+
+Math and diagrams embed as images; themes don't translate (plain slides);
+and since PowerPoint has no flow layout, block positions are estimated —
+expect to nudge things. [Image highlights](writing/images.md#highlighting-parts-of-an-image)
+map to real editable DrawingML shapes over the picture — a translucent
+`fill` box/ellipse, an `under` patch behind the picture, or a `spotlight`
+scrim with the picked regions cut out — so you can restyle or reposition
+them in PowerPoint. (Two caveats: a `clip` wash can't follow the image's
+alpha as a vector shape, and a spotlight over an `ellipse` region is cut as
+a rectangle; both are reported.) For a pixel-faithful (non-editable) `.pptx`
+of the deck exactly as presented, use
+[`preso --export-pptx`](exporting.md) instead.

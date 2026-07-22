@@ -284,8 +284,18 @@ pub struct SlideContext<'a> {
     /// resolved (per-slide override → theme). See [`resolve_halign`].
     pub halign: preso_style::HorizontalAlign,
     /// Current reveal step (0-based). Selects the click-through highlight
-    /// stage of multi-stage code blocks (`{2-3|5|all}`).
+    /// stage of multi-stage code blocks (`{2-3|5|all}`) and which
+    /// `<!-- highlight[n]: … -->` image callouts are visible.
     pub step: usize,
+    /// DPI factor of the window being rendered into, for the tiny-skia
+    /// canvas workarounds (see `overlay::compensated_frame`). `1.0` in
+    /// offscreen contexts (export).
+    pub scale_factor: f32,
+    /// Highlight-author mode (`H` on the presenter): stack an interactive
+    /// drag canvas over every image so dragging a box publishes a
+    /// `preso-hl-draw:` URI (see `HighlightAuthor`). Only ever set for the
+    /// presenter's *current* slide, which renders interactively.
+    pub authoring: bool,
 }
 
 /// Resolve a slide's horizontal alignment: a per-slide `halign=` override
@@ -351,6 +361,7 @@ impl<'a> PresoViewer<'a> {
             ..base
         };
         let mono = code_font(self.ctx.theme);
+        let mark = mark_highlight(self.ctx.theme, scale);
         // Per-table `<!-- table: size=NN -->` overrides the body text size.
         let size = table
             .font_size
@@ -377,7 +388,7 @@ impl<'a> PresoViewer<'a> {
                 // `<br>` in a cell becomes a hard line break (iced's text
                 // honours `\n`); GFM rows can't hold real newlines.
                 let s = normalize_breaks(s);
-                let txt = rich_text(inline_spans(&s, font, mono, fg))
+                let txt = rich_text(inline_spans(&s, font, mono, fg, mark))
                     .on_link_click(|u| u)
                     .size(size);
                 let align = match table.aligns.get(c).copied().unwrap_or_default() {
@@ -442,7 +453,11 @@ impl<'a> PresoViewer<'a> {
             .map(|p| self.ctx.content_width() * p / 100.0);
         let (border, shadow) = attrs.framing(self.ctx.theme);
 
+        let shapes = self.resolve_shapes(attrs);
+
         // Animated GIFs: pick the frame for the current animation time.
+        // `clip` washes need static pixels to composite into, so they don't
+        // apply to GIFs; the shapes fall back to the canvas overlay.
         if base_url.to_lowercase().ends_with(".gif")
             && let Some(gif) = self.ctx.media.gif(base_url)
         {
@@ -451,8 +466,18 @@ impl<'a> PresoViewer<'a> {
                 .unwrap_or(gif.size.width * self.ctx.scale)
                 .min(max_width);
             let height = width * gif.size.height / gif.size.width.max(1.0);
+            let img = self.overlay_shapes(
+                iced::widget::image(frame)
+                    .width(width)
+                    .height(height)
+                    .into(),
+                &shapes,
+                false,
+                width,
+                height,
+            );
             return Some(framed_image(
-                iced::widget::image(frame).width(width).height(height),
+                img,
                 border,
                 shadow,
                 self.ctx.scale,
@@ -460,16 +485,29 @@ impl<'a> PresoViewer<'a> {
             ));
         }
 
-        let (handle, size) = self.ctx.media.slide_image(base_url, target_width)?;
+        // A `clip` highlight bakes its wash into the image's opaque pixels
+        // (respecting alpha), so the transparent background is untouched.
+        let ops: Vec<crate::media::MaskOp> = shapes.iter().filter_map(|s| s.mask_op()).collect();
+        let masked = (!ops.is_empty())
+            .then(|| self.ctx.media.masked_image(base_url, target_width, &ops))
+            .flatten();
+        let baked = masked.is_some();
+        let (handle, size) = match masked {
+            Some(hs) => hs,
+            None => self.ctx.media.slide_image(base_url, target_width)?,
+        };
+
         let is_vector = base_url.to_lowercase().ends_with(".svg");
         let radius = border.map(|b| b.radius * self.ctx.scale).unwrap_or(0.0);
         let img = iced::widget::image(handle).border_radius(radius);
-        let img = if size == iced::Size::ZERO {
-            // Dimensions unknown (unreadable header): best effort.
+        let img: Element<'a, markdown::Uri> = if size == iced::Size::ZERO {
+            // Dimensions unknown (unreadable header): best effort — no
+            // highlight overlay either, its box needs a known height.
             match target_width {
                 Some(width) => img.width(width.min(max_width)),
                 None => img.width(max_width),
             }
+            .into()
         } else {
             // Vector rasters are already at display size; bitmaps are
             // natural pixels mapped through the canvas scale.
@@ -480,7 +518,13 @@ impl<'a> PresoViewer<'a> {
             };
             let width = target_width.unwrap_or(natural.width).min(max_width);
             let height = width * natural.height / natural.width.max(1.0);
-            img.width(width).height(height)
+            self.overlay_shapes(
+                img.width(width).height(height).into(),
+                &shapes,
+                baked,
+                width,
+                height,
+            )
         };
         Some(framed_image(
             img,
@@ -489,6 +533,82 @@ impl<'a> PresoViewer<'a> {
             self.ctx.scale,
             self.ctx.theme,
         ))
+    }
+
+    /// The image's `<!-- highlight: … -->` shapes visible at the current
+    /// reveal step, resolved against the theme. Empty when the image has no
+    /// `hl:` fragment token or no shape is visible yet.
+    fn resolve_shapes(&self, attrs: &ImageAttrs) -> Vec<ResolvedHighlight> {
+        let Some(group) = attrs
+            .highlight
+            .and_then(|i| self.ctx.math_slide.highlights.get(i))
+        else {
+            return Vec::new();
+        };
+        group
+            .iter()
+            .filter(|h| h.step.is_none_or(|s| s <= self.ctx.step))
+            .map(|h| ResolvedHighlight::new(h, self.ctx.theme, self.ctx.scale))
+            .collect()
+    }
+
+    /// Stack the highlight canvases around the image: `mode=under` shapes
+    /// below it (showing through transparent pixels), the rest above.
+    /// `baked` = the image already has its `clip` washes composited in
+    /// (via `Media::masked_image`), so those shapes are skipped here; when
+    /// `false` (GIF, or a masking fallback) they draw on the canvas
+    /// unmasked. Runs before framing, so callouts cover only the image.
+    fn overlay_shapes(
+        &self,
+        img: Element<'a, markdown::Uri>,
+        shapes: &[ResolvedHighlight],
+        baked: bool,
+        width: f32,
+        height: f32,
+    ) -> Element<'a, markdown::Uri> {
+        let under: Vec<ResolvedHighlight> = shapes.iter().filter(|s| s.under).copied().collect();
+        // Over-image canvas: everything not drawn below the image and not
+        // already baked into its pixels (a `clip` wash when `baked`).
+        let over: Vec<ResolvedHighlight> = shapes
+            .iter()
+            .filter(|s| !(s.under || (baked && s.clip)))
+            .copied()
+            .collect();
+        let authoring = self.ctx.authoring;
+        if under.is_empty() && over.is_empty() && !authoring {
+            return img;
+        }
+        let layer = |shapes: Vec<ResolvedHighlight>| -> Element<'a, markdown::Uri> {
+            iced::widget::canvas(HighlightOverlay {
+                shapes,
+                scale_factor: self.ctx.scale_factor,
+            })
+            .width(width)
+            .height(height)
+            .into()
+        };
+        let mut layers: Vec<Element<'a, markdown::Uri>> = Vec::with_capacity(4);
+        if !under.is_empty() {
+            layers.push(layer(under));
+        }
+        layers.push(img);
+        if !over.is_empty() {
+            layers.push(layer(over));
+        }
+        // Highlight-author mode: an interactive drag canvas on top of every
+        // image, so any of them can be boxed to copy a directive.
+        if authoring {
+            layers.push(
+                iced::widget::canvas(HighlightAuthor {
+                    accent: color(self.ctx.theme.colors.accent),
+                    scale_factor: self.ctx.scale_factor,
+                })
+                .width(width)
+                .height(height)
+                .into(),
+            );
+        }
+        iced::widget::stack(layers).into()
     }
 
     /// Lay a [`preso_core::ImageRow`] out horizontally: each image gets an
@@ -556,11 +676,58 @@ impl<'a> PresoViewer<'a> {
 
 /// Render a table cell's inline markdown (`` `code` `` and `**bold**`) into
 /// owned rich-text spans. Everything else passes through as plain text.
+/// The `==mark==` background style: the theme's `colors.mark`, else the
+/// accent at ~35% alpha so it works on both dark and light themes.
+fn mark_highlight(theme: &preso_style::Theme, scale: f32) -> markdown::Highlight {
+    let bg = theme.colors.mark.unwrap_or(preso_style::Color {
+        a: 90,
+        ..theme.colors.accent
+    });
+    markdown::Highlight {
+        background: color(bg).into(),
+        border: border::rounded((4.0 * scale).round()),
+    }
+}
+
+/// Restyle sentinel-tagged spans as text highlights. preso-core rewrites
+/// `==marked==` into inline code prefixed with `MARK_SENTINEL` (the only
+/// inline construct the markdown widget can background); here the tag is
+/// stripped and the span switches back to the inherited font and color,
+/// with the mark background in place of the code one. Untagged spans pass
+/// through unchanged.
+fn restyle_marks(
+    spans: &[iced::widget::text::Span<'static, markdown::Uri>],
+    mark: markdown::Highlight,
+) -> Vec<iced::widget::text::Span<'static, markdown::Uri>> {
+    spans
+        .iter()
+        .map(|span| {
+            let Some(stripped) = span.text.strip_prefix(preso_core::parser::MARK_SENTINEL) else {
+                return span.clone();
+            };
+            let mut s = span.clone();
+            s.text = stripped.to_string().into();
+            s.font = None; // inherit the surrounding text font, not code
+            s.color = None; // inherit the surrounding text color
+            s.highlight = Some(mark);
+            s
+        })
+        .collect()
+}
+
+/// Whether any span carries the `==mark==` sentinel tag.
+fn has_marks(spans: &[iced::widget::text::Span<'static, markdown::Uri>]) -> bool {
+    spans
+        .iter()
+        .any(|s| s.text.starts_with(preso_core::parser::MARK_SENTINEL))
+}
+
 fn inline_spans(
     text: &str,
     base: Font,
     mono: Font,
     fg: Color,
+    mark: markdown::Highlight,
 ) -> Vec<iced::widget::text::Span<'static, markdown::Uri, Font>> {
     use iced::widget::span;
     let mut out = Vec::new();
@@ -585,6 +752,27 @@ fn inline_spans(
                 out.push(span(std::mem::take(&mut plain)).font(base).color(fg));
             }
             out.push(span(after[..end].to_string()).font(bold_of(base)).color(fg));
+            i += 2 + end + 2;
+            continue;
+        }
+        // `==marked==` cell text renders with the mark background. Table
+        // cells keep their raw markdown (they're lifted before the parser's
+        // sentinel rewrite), so the marks are parsed here directly.
+        if let Some(after) = rest.strip_prefix("==")
+            && let Some(end) = after.find("==")
+            && !after[..end].is_empty()
+            && after[..end].trim() == &after[..end]
+        {
+            if !plain.is_empty() {
+                out.push(span(std::mem::take(&mut plain)).font(base).color(fg));
+            }
+            out.push(
+                span(after[..end].to_string())
+                    .font(base)
+                    .color(fg)
+                    .background(mark.background)
+                    .border(mark.border),
+            );
             i += 2 + end + 2;
             continue;
         }
@@ -689,11 +877,13 @@ impl<'a> markdown::Viewer<'a, markdown::Uri> for PresoViewer<'a> {
                 .or(style.color)
                 .unwrap_or(self.ctx.theme.colors.heading),
         );
-        let spans: Vec<_> = text
-            .spans(settings.style)
-            .iter()
-            .map(|span| span.clone().color(heading_color))
-            .collect();
+        let spans: Vec<_> = restyle_marks(
+            &text.spans(settings.style),
+            mark_highlight(self.ctx.theme, self.ctx.scale),
+        )
+        .into_iter()
+        .map(|span| span.color(heading_color))
+        .collect();
 
         container(
             rich_text(spans)
@@ -713,6 +903,28 @@ impl<'a> markdown::Viewer<'a, markdown::Uri> for PresoViewer<'a> {
         } else {
             0.0
         }))
+        .into()
+    }
+
+    fn paragraph(
+        &self,
+        settings: markdown::Settings,
+        text: &markdown::Text,
+    ) -> Element<'a, markdown::Uri> {
+        // `==marked==` text arrives as sentinel-tagged inline code (see
+        // preso-core's `replace_marks`); restyle those spans as highlights.
+        // Lists and quotes render their items through this method too, so
+        // marks work everywhere prose flows.
+        let spans = text.spans(settings.style);
+        if !has_marks(&spans) {
+            return markdown::paragraph(settings, text, Self::on_link_click);
+        }
+        rich_text(restyle_marks(
+            &spans,
+            mark_highlight(self.ctx.theme, self.ctx.scale),
+        ))
+        .size(settings.text_size)
+        .on_link_click(Self::on_link_click)
         .into()
     }
 
@@ -1117,6 +1329,9 @@ struct ImageAttrs {
     /// In an image row: take the image's actual width instead of an equal
     /// share of the row (any flagged image switches the whole row).
     fit: bool,
+    /// Index of the image's highlight group in `Slide::highlights`, from
+    /// the `hl:N` token the parser appends for `<!-- highlight: … -->`.
+    highlight: Option<usize>,
 }
 
 impl ImageAttrs {
@@ -1150,6 +1365,342 @@ impl ImageAttrs {
     }
 }
 
+/// One image callout resolved for drawing: shape, fractional region, and
+/// final colors.
+#[derive(Clone, Copy)]
+struct ResolvedHighlight {
+    ellipse: bool,
+    /// `mode=spotlight`: this region is a hole in a scrim dimming the rest
+    /// of the image, instead of a fill over the region.
+    spotlight: bool,
+    /// `mode=under`: drawn on the canvas layered below the image (the
+    /// split into layers happens in `PresoViewer::overlay_shapes`).
+    under: bool,
+    /// `clip`: bake the wash into the image's opaque pixels (via
+    /// `Media::masked_image`) rather than drawing it as a canvas rectangle,
+    /// so a transparent image's background stays untouched. Fill/spotlight
+    /// only; ignored for `under`.
+    clip: bool,
+    /// Top-left corner and size as fractions of the image.
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    fill: Color,
+    /// Outline color and width in logical px; `None` = no outline.
+    stroke: Option<(Color, f32)>,
+}
+
+impl ResolvedHighlight {
+    fn new(h: &preso_core::Highlight, theme: &preso_style::Theme, scale: f32) -> Self {
+        let palette = &theme.colors;
+        // `color=` takes a palette name or `#hex`; anything unparseable
+        // falls back to the accent rather than dropping the callout.
+        use preso_core::HighlightMode as Mode;
+        let base = match h.color.as_deref() {
+            // An uncolored spotlight dims with black — the accent (often a
+            // light tint) would brighten the surroundings instead.
+            None if h.mode == Mode::Spotlight => preso_style::Color::rgb(0, 0, 0),
+            None | Some("accent") => palette.accent,
+            Some("text") => palette.text,
+            Some("heading") => palette.heading,
+            Some("link") => palette.link,
+            Some("muted") => palette.muted,
+            Some(other) => preso_style::Color::parse(other).unwrap_or(palette.accent),
+        };
+        let base = color(base);
+        Self {
+            ellipse: matches!(h.shape, preso_core::HighlightShape::Ellipse),
+            spotlight: h.mode == Mode::Spotlight,
+            under: h.mode == Mode::Under,
+            // `clip` only masks fill/spotlight washes; `under` draws its own
+            // way (behind the image), so ignore clip there.
+            clip: h.clip && h.mode != Mode::Under,
+            x: h.x,
+            y: h.y,
+            w: h.w,
+            h: h.h,
+            fill: Color {
+                a: base.a * h.opacity,
+                ..base
+            },
+            stroke: (h.stroke > 0.0).then(|| (base, (h.stroke * scale).max(1.0))),
+        }
+    }
+
+    /// This shape as a pixel-composite op for [`Media::masked_image`], or
+    /// `None` if it isn't a clipped wash. `clip` washes bake into the image;
+    /// they carry no outline (a rect/ellipse outline wouldn't follow the
+    /// image's silhouette anyway).
+    fn mask_op(&self) -> Option<crate::media::MaskOp> {
+        if !self.clip || self.fill.a <= 0.0 {
+            return None;
+        }
+        let to_u8 = |c: f32| (c * 255.0).round() as u8;
+        Some(crate::media::MaskOp {
+            ellipse: self.ellipse,
+            spotlight: self.spotlight,
+            x: self.x,
+            y: self.y,
+            w: self.w,
+            h: self.h,
+            color: (to_u8(self.fill.r), to_u8(self.fill.g), to_u8(self.fill.b)),
+            alpha: self.fill.a,
+        })
+    }
+
+    /// Trace the region outline into a path builder, in canvas coordinates
+    /// (`origin` is the compensated frame offset, `size` the canvas size).
+    fn trace(
+        &self,
+        b: &mut iced::widget::canvas::path::Builder,
+        origin: iced::Point,
+        size: iced::Size,
+    ) {
+        let top_left = iced::Point::new(
+            origin.x + self.x * size.width,
+            origin.y + self.y * size.height,
+        );
+        let region = iced::Size::new(self.w * size.width, self.h * size.height);
+        if self.ellipse {
+            b.ellipse(iced::widget::canvas::path::arc::Elliptical {
+                center: iced::Point::new(
+                    top_left.x + region.width / 2.0,
+                    top_left.y + region.height / 2.0,
+                ),
+                radii: iced::Vector::new(region.width / 2.0, region.height / 2.0),
+                rotation: iced::Radians(0.0),
+                start_angle: iced::Radians(0.0),
+                end_angle: iced::Radians(std::f32::consts::TAU),
+            });
+        } else {
+            b.rectangle(top_left, region);
+        }
+    }
+}
+
+/// Canvas program painting a highlight group over its image. The canvas
+/// fills the image's stack, so fractional coordinates just scale by the
+/// widget bounds.
+struct HighlightOverlay {
+    shapes: Vec<ResolvedHighlight>,
+    /// Window DPI factor, for `overlay::compensated_frame`.
+    scale_factor: f32,
+}
+
+impl<M> iced::widget::canvas::Program<M> for HighlightOverlay {
+    type State = ();
+
+    fn draw(
+        &self,
+        _state: &(),
+        renderer: &iced::Renderer,
+        _theme: &iced::Theme,
+        bounds: iced::Rectangle,
+        _cursor: iced::mouse::Cursor,
+    ) -> Vec<iced::widget::canvas::Geometry> {
+        use iced::widget::canvas;
+        let (mut frame, origin) =
+            crate::overlay::compensated_frame(renderer, bounds, self.scale_factor);
+        let size = bounds.size();
+
+        // Spotlight scrim: one even-odd fill covering the whole image with
+        // every visible spotlight region punched out, so those regions stay
+        // at full fidelity while the rest dims. The first spotlight shape's
+        // color/opacity styles the scrim.
+        let spots: Vec<&ResolvedHighlight> = self.shapes.iter().filter(|s| s.spotlight).collect();
+        if let Some(first) = spots.first().filter(|s| s.fill.a > 0.0) {
+            let scrim = canvas::Path::new(|b| {
+                b.rectangle(origin, size);
+                for s in &spots {
+                    s.trace(b, origin, size);
+                }
+            });
+            frame.fill(
+                &scrim,
+                canvas::Fill {
+                    style: canvas::Style::Solid(first.fill),
+                    rule: canvas::fill::Rule::EvenOdd,
+                },
+            );
+        }
+
+        for s in &self.shapes {
+            let path = canvas::Path::new(|b| s.trace(b, origin, size));
+            if !s.spotlight && s.fill.a > 0.0 {
+                frame.fill(&path, s.fill);
+            }
+            if let Some((stroke_color, width)) = s.stroke {
+                frame.stroke(
+                    &path,
+                    canvas::Stroke::default()
+                        .with_color(stroke_color)
+                        .with_width(width),
+                );
+            }
+        }
+        vec![frame.into_geometry()]
+    }
+}
+
+/// Highlight-author overlay (`H` mode): an interactive canvas the size of
+/// the image. Dragging a box publishes a `preso-hl-draw:x,y,w,h` URI —
+/// percentages of the image — which rides the slide's normal link path to
+/// [`crate::app::Message::LinkClicked`], where it becomes a
+/// `<!-- highlight: rect … -->` directive on the clipboard. Because its
+/// bounds equal the image's, the drag is already image-relative.
+struct HighlightAuthor {
+    accent: iced::Color,
+    scale_factor: f32,
+}
+
+impl HighlightAuthor {
+    /// Cursor → image fraction (0..1 each axis), clamped so a drag that
+    /// leaves the image sticks to its edge.
+    fn frac(bounds: iced::Rectangle, cursor: iced::mouse::Cursor) -> Option<iced::Point> {
+        let p = cursor.position()?;
+        Some(iced::Point::new(
+            ((p.x - bounds.x) / bounds.width.max(1.0)).clamp(0.0, 1.0),
+            ((p.y - bounds.y) / bounds.height.max(1.0)).clamp(0.0, 1.0),
+        ))
+    }
+}
+
+impl iced::widget::canvas::Program<markdown::Uri> for HighlightAuthor {
+    /// The in-progress drag as `(start, current)` image fractions, or `None`
+    /// when idle.
+    type State = Option<(iced::Point, iced::Point)>;
+
+    fn update(
+        &self,
+        state: &mut Self::State,
+        event: &iced::widget::canvas::Event,
+        bounds: iced::Rectangle,
+        cursor: iced::mouse::Cursor,
+    ) -> Option<iced::widget::canvas::Action<markdown::Uri>> {
+        use iced::mouse::{Button, Event as Mouse};
+        use iced::widget::canvas::Action;
+        match event {
+            // Only a press *inside this image* starts a drag, so sibling
+            // image canvases don't all react to one press.
+            iced::Event::Mouse(Mouse::ButtonPressed(Button::Left)) => {
+                let start = cursor.position_in(bounds).map(|p| {
+                    iced::Point::new(
+                        (p.x / bounds.width.max(1.0)).clamp(0.0, 1.0),
+                        (p.y / bounds.height.max(1.0)).clamp(0.0, 1.0),
+                    )
+                })?;
+                *state = Some((start, start));
+                Some(Action::request_redraw().and_capture())
+            }
+            iced::Event::Mouse(Mouse::CursorMoved { .. }) => {
+                let (start, _) = (*state)?;
+                let current = Self::frac(bounds, cursor).unwrap_or(start);
+                *state = Some((start, current));
+                Some(Action::request_redraw().and_capture())
+            }
+            iced::Event::Mouse(Mouse::ButtonReleased(Button::Left)) => {
+                let (start, _) = (*state)?;
+                let end = Self::frac(bounds, cursor).unwrap_or(start);
+                *state = None;
+                let (uri, redraw_only) = author_uri(start, end);
+                match uri {
+                    Some(uri) if !redraw_only => Some(Action::publish(uri).and_capture()),
+                    // A click or a hair-thin slip: nothing to copy, just clear.
+                    _ => Some(Action::request_redraw().and_capture()),
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn draw(
+        &self,
+        state: &Self::State,
+        renderer: &iced::Renderer,
+        _theme: &iced::Theme,
+        bounds: iced::Rectangle,
+        _cursor: iced::mouse::Cursor,
+    ) -> Vec<iced::widget::canvas::Geometry> {
+        use iced::widget::canvas;
+        let (mut frame, origin) =
+            crate::overlay::compensated_frame(renderer, bounds, self.scale_factor);
+        if let Some((a, b)) = state {
+            let x = a.x.min(b.x) * bounds.width;
+            let y = a.y.min(b.y) * bounds.height;
+            let w = (a.x - b.x).abs() * bounds.width;
+            let h = (a.y - b.y).abs() * bounds.height;
+            let rect = canvas::Path::rectangle(
+                iced::Point::new(origin.x + x, origin.y + y),
+                iced::Size::new(w, h),
+            );
+            frame.fill(
+                &rect,
+                iced::Color {
+                    a: 0.22,
+                    ..self.accent
+                },
+            );
+            frame.stroke(
+                &rect,
+                canvas::Stroke::default()
+                    .with_color(self.accent)
+                    .with_width(2.0),
+            );
+        }
+        vec![frame.into_geometry()]
+    }
+
+    fn mouse_interaction(
+        &self,
+        _state: &Self::State,
+        _bounds: iced::Rectangle,
+        _cursor: iced::mouse::Cursor,
+    ) -> iced::mouse::Interaction {
+        iced::mouse::Interaction::Crosshair
+    }
+}
+
+/// Two image-fraction corners → a `preso-hl-draw:` URI. Returns
+/// `(uri, redraw_only)`: `redraw_only` is `true` for a drag too small to be
+/// a deliberate box (a click), so the caller just clears the rubber band.
+/// Coordinates are emitted as whole percentages of the image.
+fn author_uri(start: iced::Point, end: iced::Point) -> (Option<markdown::Uri>, bool) {
+    let x = start.x.min(end.x);
+    let y = start.y.min(end.y);
+    let w = (start.x - end.x).abs();
+    let h = (start.y - end.y).abs();
+    if w < 0.01 || h < 0.01 {
+        return (None, true);
+    }
+    let pct = |f: f32| (f * 100.0).round() as i32;
+    (
+        Some(format!(
+            "preso-hl-draw:{},{},{},{}",
+            pct(x),
+            pct(y),
+            pct(w),
+            pct(h)
+        )),
+        false,
+    )
+}
+
+/// Parse a `preso-hl-draw:x,y,w,h` URI (whole percentages) into the
+/// `<!-- highlight: rect … -->` directive it should produce, or `None` if
+/// it isn't one. Shared by the click handler and its test.
+pub fn author_directive(uri: &str) -> Option<String> {
+    let body = uri.strip_prefix("preso-hl-draw:")?;
+    let mut it = body.split(',').map(|n| n.trim().parse::<i32>().ok());
+    let (x, y, w, h) = (it.next()??, it.next()??, it.next()??, it.next()??);
+    if it.next().is_some() {
+        return None;
+    }
+    Some(format!(
+        "<!-- highlight: rect x={x}% y={y}% w={w}% h={h}% -->"
+    ))
+}
+
 /// Split a markdown image URL into the real path and its decoded attrs
 /// (`x.png#preso-img=width:30+border` → `x.png` + width/border).
 fn parse_image_fragment(url: &str) -> (&str, ImageAttrs) {
@@ -1166,6 +1717,8 @@ fn parse_image_fragment(url: &str) -> (&str, ImageAttrs) {
             _ => {
                 if let Some(pct) = token.strip_prefix("width:") {
                     attrs.width_pct = pct.parse().ok();
+                } else if let Some(index) = token.strip_prefix("hl:") {
+                    attrs.highlight = index.parse().ok();
                 } else if let Some(a) = token.strip_prefix("align:") {
                     use preso_style::HorizontalAlign as H;
                     attrs.align = match a {
@@ -1257,10 +1810,14 @@ pub struct SurfaceOptions {
     pub footnote: Option<String>,
     /// Decoration images (`<!-- image: … -->`) drawn below the content.
     pub layer_images: Vec<preso_core::LayerImage>,
-    /// The slide has a `<!-- video: … -->` clip: draw a centered ▶ play badge
-    /// as the affordance. Playback itself launches an external player (preso
-    /// can't decode video on the tiny-skia backend).
+    /// The slide has a `<!-- video: … -->` clip: draw a centered play/pause
+    /// badge as the affordance. Playback is inline under the `video` feature
+    /// (wgpu) or an external player otherwise.
     pub video: bool,
+    /// The clip is currently playing: the badge shows ⏸ (running) instead of
+    /// ▶ (paused/idle). Drives the presenter's video feedback — the audience
+    /// hides the badge entirely while the clip plays over the slide.
+    pub video_playing: bool,
     /// Dither gradient backgrounds (screen). PDF export turns this off:
     /// dither noise defeats JPEG compression (~14x larger pages), and
     /// iced's plain gradient is what exports always shipped.
@@ -1286,6 +1843,7 @@ pub fn slide_surface<'a>(
         footnote,
         layer_images,
         video,
+        video_playing,
         dither,
     } = options;
     let (width, height) = (size.width, size.height);
@@ -1354,10 +1912,11 @@ pub fn slide_surface<'a>(
     };
     layers.push(content.into());
 
-    // 2.5. Video affordance: a centered ▶ play badge for `<!-- video: … -->`
-    //      slides. It sits above the content, so it dissolves with the slide.
+    // 2.5. Video affordance: a centered play/pause badge for
+    //      `<!-- video: … -->` slides. It sits above the content, so it
+    //      dissolves with the slide.
     if video {
-        layers.push(video_badge_layer(scale));
+        layers.push(video_badge_layer(scale, video_playing));
     }
 
     // 3. (Slide transitions are no longer a veil inside the surface; the
@@ -1511,15 +2070,20 @@ fn layer_image_element<'a>(
     Some(positioned.into())
 }
 
-/// Layer 2.5: the centered ▶ play badge for `<!-- video: … -->` slides.
-/// Playback itself is handled by the `video` module (inline under wgpu with
-/// the `video` feature, else an external player).
-fn video_badge_layer<'a>(scale: f32) -> Element<'a, Message> {
+/// Layer 2.5: the centered play/pause badge for `<!-- video: … -->` slides —
+/// ⏸ while the clip runs, ▶ when paused or idle. Playback itself is handled
+/// by the `video` module (inline under wgpu with the `video` feature, else an
+/// external player).
+fn video_badge_layer<'a>(scale: f32, playing: bool) -> Element<'a, Message> {
     use iced::alignment::{Horizontal, Vertical};
 
     let diameter = 130.0 * scale;
+    // Both glyphs are solid Geometric-Shapes characters (not the emoji-styled
+    // U+23F8 ⏸, which renders in a box on macOS), so pause matches play's
+    // weight: two black vertical bars vs. the black triangle.
+    let glyph = if playing { "▮▮" } else { "▶" };
     let badge = container(
-        iced::widget::text("▶")
+        iced::widget::text(glyph)
             .size(56.0 * scale)
             .color(iced::Color::WHITE),
     )
@@ -1727,6 +2291,37 @@ pub fn slide_inert<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn author_drag_normalizes_and_formats() {
+        use iced::Point;
+        // A left-to-right, top-to-bottom drag.
+        let fwd = author_uri(Point::new(0.12, 0.20), Point::new(0.27, 0.47));
+        assert_eq!(fwd, (Some("preso-hl-draw:12,20,15,27".into()), false));
+        // Dragging the other way gives the same top-left corner and size.
+        let rev = author_uri(Point::new(0.27, 0.47), Point::new(0.12, 0.20));
+        assert_eq!(rev.0, fwd.0);
+        // …and the URI round-trips into the directive the click handler copies.
+        assert_eq!(
+            author_directive(&fwd.0.unwrap()).unwrap(),
+            "<!-- highlight: rect x=12% y=20% w=15% h=27% -->"
+        );
+    }
+
+    #[test]
+    fn author_drag_ignores_clicks_and_bad_uris() {
+        use iced::Point;
+        // A near-zero-area drag (a click) copies nothing.
+        assert_eq!(
+            author_uri(Point::new(0.5, 0.5), Point::new(0.505, 0.5)),
+            (None, true)
+        );
+        // Non-author and malformed URIs don't yield a directive.
+        assert!(author_directive("https://example.com").is_none());
+        assert!(author_directive("preso-hl-draw:1,2,3").is_none());
+        assert!(author_directive("preso-hl-draw:1,2,3,4,5").is_none());
+        assert!(author_directive("preso-hl-draw:a,b,c,d").is_none());
+    }
 
     #[test]
     fn bundled_font_family_names() {

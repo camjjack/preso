@@ -9,6 +9,7 @@ ignore = [
     { id = "RUSTSEC-2025-0141", reason = "bincode 1.x unmaintained, via syntect → two-face (iced's highlighter). Only deserializes the crates' own bundled syntax/theme dumps, never untrusted input; resolves when syntect moves on." },
     { id = "RUSTSEC-2025-0057", reason = "fxhash unmaintained, via display-info. A hash function with no untrusted input in this use; no safe upgrade exists." },
     { id = "RUSTSEC-2024-0436", reason = "paste unmaintained, via wgpu's metal backend. Compile-time proc-macro only; the whole wgpu ecosystem carries this until upstream drops it." },
+    { id = "RUSTSEC-2026-0206", reason = "rustybuzz unmaintained, via cosmic-text — iced's text shaper. Inputs are bundled/system fonts, not attacker files; goes away when cosmic-text migrates shapers." },
     { id = "RUSTSEC-2026-0194", reason = "quick-xml 0.30 quadratic parse on crafted XML, pinned by xcb (parses the X11 protocol definitions bundled in the crate at build time) and plist → syntect (bundled .tmTheme files). No attacker-controlled XML reaches it." },
     { id = "RUSTSEC-2026-0195", reason = "second advisory against the same quick-xml 0.30 pin as above." },
     { id = "RUSTSEC-2026-0192", reason = "ttf-parser unmaintained. Used directly (reading bundled/theme font name tables) and throughout the resvg/fontdb/iced font stack; the ecosystem has no replacement yet. Inputs are fonts we ship or the user installs, not attacker files." },

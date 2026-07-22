@@ -21,6 +21,10 @@ their own line; they're invisible in other markdown viewers.
 | `<!-- slide: background=#rrggbb -->` | Solid per-slide background colour. |
 | `<!-- slide: background=path.jpg -->` | [Full-bleed background image](../writing/images.md#full-bleed-backgrounds). |
 | `<!-- image: path … -->` | [Positioned image](../writing/images.md#positioned-images-behind-the-text) on a layer behind the text (`position`/`width`/`opacity`/`padding`). |
+| `<!-- highlight: rect\|ellipse x= y= w= h= … -->` | [Highlight a region](../writing/images.md#highlighting-parts-of-an-image) of the next image (`color`/`opacity`/`stroke`; coordinates in % of the image). |
+| `<!-- highlight: … spotlight -->` | [Spotlight mode](../writing/images.md#spotlight-mode): dim everything *except* the region (also `mode=spotlight`). |
+| `<!-- highlight: … under -->` | [Under mode](../writing/images.md#under-mode-transparent-images): solid shape *behind* the image — shows through transparent pixels (also `mode=under`/`behind`). |
+| `<!-- highlight: … clip -->` | [Clip to the image](../writing/images.md#clipping-to-a-transparent-image): confine a fill/spotlight wash to the image's opaque pixels, sparing the transparent background. |
 | `<!-- slide: hidden -->` | Drop the slide — it appears in neither the presentation nor the PDF. |
 | `<!-- slide: number=N -->` | Reset the slide number to `N`; later slides continue from there. |
 | `<!-- slide: transition=fade\|wipe\|none -->` | [Transition](../appendix/rendering.md#transitions) for the change *into* this slide, overriding the deck default. |
@@ -36,6 +40,7 @@ sit alongside the others (`<!-- slide: kind=section hidden -->`).
 | Directive | Meaning |
 |-----------|---------|
 | `<!-- pause -->` | Start a new [reveal step](../writing/reveal-steps.md). |
+| `<!-- highlight[n]: … -->` | [Image highlight](../writing/images.md#stepping-through-highlights) shown from reveal step `n` onward (mints steps by itself). |
 | `<!-- v-click -->` | Synonym for `<!-- pause -->`. |
 | `<!-- note: … -->` | [Speaker note](../writing/reveal-steps.md#speaker-notes) (may span lines). |
 | `<!-- note[n]: … -->` | Note shown from reveal step `n` onward. |
@@ -65,6 +70,7 @@ After the language on a code/diagram fence, in `{…}`:
 | Syntax | Meaning |
 |--------|---------|
 | `![alt](path){width=NN% align=center border shadow plain fit}` | [Image](../writing/images.md) with sizing/alignment/framing (`fit` packs an image row at the images' actual widths instead of sharing the width equally). |
+| `==text==` | [Highlighted text](../writing/text-tables.md#highlighted-text): a marker background behind the words (themable via `colors.mark`). |
 | `$$ … $$` | [Display math](../writing/math.md). |
 | `$ … $` | Inline math. |
 | `` ```mermaid `` / `` ```dot `` | [Mermaid / Graphviz diagrams](../writing/diagrams.md). |

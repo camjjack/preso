@@ -1,8 +1,8 @@
 use crate::error::ParseError;
 use crate::fence;
 use crate::model::{
-    Anchor, CodeBlock, Frontmatter, ImageRef, ImageRow, LayerImage, Layout, MathBlock, Note, Slide,
-    SlideOverrides, Table, TableAlign,
+    Anchor, CodeBlock, Frontmatter, Highlight, HighlightMode, HighlightShape, ImageRef, ImageRow,
+    LayerImage, Layout, MathBlock, Note, Slide, SlideOverrides, Table, TableAlign,
 };
 
 /// Result of parsing a deck source file.
@@ -76,6 +76,19 @@ fn extract_frontmatter(source: &str) -> Result<(Frontmatter, usize), ParseError>
     Ok((Frontmatter::default(), 0))
 }
 
+/// A deck split into its raw pieces: typed frontmatter plus each slide's
+/// original markdown, directives intact. For tools that *transform* preso
+/// source rather than render it (preso-convert's exporters); [`parse`]
+/// returns the cleaned, render-ready model instead.
+pub fn raw_deck(source: &str) -> Result<(Frontmatter, Vec<String>), ParseError> {
+    let (frontmatter, body_start) = extract_frontmatter(source)?;
+    let slides = split_slides(source, body_start)
+        .into_iter()
+        .map(|raw| raw.source)
+        .collect();
+    Ok((frontmatter, slides))
+}
+
 struct RawSlide {
     source: String,
     start_line: usize,
@@ -130,6 +143,9 @@ fn process_slide(raw: &str, start_line: usize) -> Slide {
     let mut tables: Vec<Table> = Vec::new();
     let mut image_rows: Vec<ImageRow> = Vec::new();
     let mut layer_images: Vec<LayerImage> = Vec::new();
+    let mut highlights: Vec<Vec<Highlight>> = Vec::new();
+    // Set by `<!-- highlight: … -->`, attached to the next image line.
+    let mut pending_highlights: Vec<Highlight> = Vec::new();
     let mut layout = Layout::default();
     let mut overrides = SlideOverrides::default();
     let mut footnote: Option<String> = None;
@@ -271,6 +287,15 @@ fn process_slide(raw: &str, start_line: usize) -> Slide {
             layer_images.push(image);
             continue;
         }
+        // Image highlight: `<!-- highlight: rect x=10% y=20% w=30% h=15% -->`
+        // (or `highlight[n]:` to reveal at step n) — a translucent callout
+        // drawn over the next image on the slide. Several stack.
+        if let Some((step, spec)) = highlight_directive(trimmed) {
+            if let Some(h) = parse_highlight(step, spec) {
+                pending_highlights.push(h);
+            }
+            continue;
+        }
         // Display math: `$$` opener (possibly one-line `$$ x $$`).
         if trimmed == "$$" {
             open_math = Some(String::new());
@@ -332,7 +357,12 @@ fn process_slide(raw: &str, start_line: usize) -> Slide {
                 run.push(lines.next().expect("peeked"));
             }
             match run.iter().map(|l| image_ref(l)).collect::<Option<Vec<_>>>() {
-                Some(images) => {
+                Some(mut images) => {
+                    // Pending highlights attach to the row's first image.
+                    if !pending_highlights.is_empty() {
+                        push_highlight_token(&mut images[0].url, highlights.len());
+                        highlights.push(std::mem::take(&mut pending_highlights));
+                    }
                     push_line(
                         chunks.last_mut().expect("non-empty"),
                         &format!("![](preso-imagerow:{})", image_rows.len()),
@@ -351,9 +381,22 @@ fn process_slide(raw: &str, start_line: usize) -> Slide {
             }
             continue;
         }
+        let mut emitted = rewrite_image_attrs(line);
+        // Pending highlights attach to the next standalone image line, as an
+        // `hl:<index>` token in its `#preso-img=` URL fragment.
+        if !pending_highlights.is_empty()
+            && is_image_line(&emitted)
+            && let Some(rest) = emitted.trim_end().strip_suffix(')')
+        {
+            let mut attached = rest.to_string();
+            push_highlight_token(&mut attached, highlights.len());
+            attached.push(')');
+            emitted = attached;
+            highlights.push(std::mem::take(&mut pending_highlights));
+        }
         push_line(
             chunks.last_mut().expect("non-empty"),
-            &replace_inline_math(&rewrite_image_attrs(line)),
+            &replace_inline_math(&replace_marks(&emitted)),
         );
     }
 
@@ -402,6 +445,7 @@ fn process_slide(raw: &str, start_line: usize) -> Slide {
         tables,
         image_rows,
         layer_images,
+        highlights,
         layout,
         overrides,
     }
@@ -458,6 +502,110 @@ fn parse_layer_image(spec: &str) -> Option<LayerImage> {
         sides[3].unwrap_or(uniform),
     ];
     Some(image)
+}
+
+/// Recognize `<!-- highlight: … -->` / `<!-- highlight[n]: … -->` (the
+/// step-gated form, like `note[n]`), returning the step and the spec text.
+/// Public because directives are a format contract shared with exporters.
+pub fn highlight_directive(trimmed: &str) -> Option<(Option<usize>, &str)> {
+    let body = trimmed.strip_prefix("<!--")?.trim_start();
+    let (step, rest) = if let Some(rest) = body.strip_prefix("highlight:") {
+        (None, rest)
+    } else if let Some(rest) = body.strip_prefix("highlight[") {
+        let close = rest.find("]:")?;
+        let n: usize = rest[..close].trim().parse().ok()?;
+        (Some(n), &rest[close + 2..])
+    } else {
+        return None;
+    };
+    Some((step, rest.strip_suffix("-->")?))
+}
+
+/// Parse a highlight spec: `rect x=10% y=20% w=30% h=15% color=#ffd54a
+/// opacity=0.35 stroke=3`. The first token is the shape (`rect`, `ellipse`,
+/// or `circle`); coordinates are percentages of the image size (`%`
+/// optional). A mode token picks how the shape paints: `spotlight` (dim
+/// everything except the region) or `under`/`behind` (solid color beneath
+/// the image — for transparent images), as `mode=…` or a bare flag. A bare
+/// `clip` flag confines a fill/spotlight wash to the image's opaque pixels
+/// (leaving a transparent image's background untouched). `None` on a
+/// malformed value or without a positive `w`/`h`, so a broken spec drops
+/// the shape instead of drawing it somewhere wrong.
+fn parse_highlight(step: Option<usize>, spec: &str) -> Option<Highlight> {
+    let mut tokens = spec.split_whitespace();
+    let shape = match tokens.next()? {
+        "rect" => HighlightShape::Rect,
+        "ellipse" | "circle" => HighlightShape::Ellipse,
+        _ => return None,
+    };
+    let mut h = Highlight {
+        shape,
+        x: 0.0,
+        y: 0.0,
+        w: 0.0,
+        h: 0.0,
+        color: None,
+        opacity: 0.35,
+        stroke: 0.0,
+        mode: HighlightMode::Fill,
+        clip: false,
+        step,
+    };
+    let pct = |v: &str| -> Option<f32> {
+        v.trim_end_matches('%')
+            .parse::<f32>()
+            .ok()
+            .filter(|n| (0.0..=100.0).contains(n))
+            .map(|n| n / 100.0)
+    };
+    let mode = |v: &str| -> Option<HighlightMode> {
+        match v {
+            "fill" => Some(HighlightMode::Fill),
+            "spotlight" => Some(HighlightMode::Spotlight),
+            "under" | "behind" => Some(HighlightMode::Under),
+            _ => None,
+        }
+    };
+    let mut opacity: Option<f32> = None;
+    for token in tokens {
+        match token.split_once('=') {
+            Some(("x", v)) => h.x = pct(v)?,
+            Some(("y", v)) => h.y = pct(v)?,
+            Some(("w", v)) => h.w = pct(v)?,
+            Some(("h", v)) => h.h = pct(v)?,
+            Some(("color", v)) => h.color = Some(v.to_string()),
+            Some(("opacity", v)) => opacity = Some(v.parse::<f32>().ok()?.clamp(0.0, 1.0)),
+            Some(("stroke", v)) => h.stroke = v.parse::<f32>().ok()?.max(0.0),
+            Some(("mode", v)) => h.mode = mode(v)?,
+            None if token == "clip" => h.clip = true,
+            None => {
+                if let Some(m) = mode(token) {
+                    h.mode = m;
+                }
+            }
+            _ => {}
+        }
+    }
+    // A solid patch behind the image wants full strength by default; the
+    // over-image modes stay translucent.
+    h.opacity = opacity.unwrap_or(match h.mode {
+        HighlightMode::Under => 1.0,
+        _ => 0.35,
+    });
+    (h.w > 0.0 && h.h > 0.0).then_some(h)
+}
+
+/// Append an `hl:<index>` token to an image URL's `#preso-img=` fragment
+/// (creating the fragment if absent), tying the image to its highlight
+/// group in `Slide::highlights`.
+fn push_highlight_token(url: &mut String, index: usize) {
+    if url.contains("#preso-img=") {
+        url.push('+');
+    } else {
+        url.push_str("#preso-img=");
+    }
+    url.push_str("hl:");
+    url.push_str(&index.to_string());
 }
 
 fn parse_anchor(s: &str) -> Anchor {
@@ -668,7 +816,8 @@ fn push_math(math_blocks: &mut Vec<MathBlock>, buf: &mut String, latex: String) 
 /// between the colon and the `-->` (untrimmed). Whitespace after `<!--` is
 /// optional and flexible — `<!--layout:` and `<!--  layout:` both match —
 /// the same tolerance note comments have always had via [`parse_note_open`].
-fn directive<'a>(trimmed: &'a str, name: &str) -> Option<&'a str> {
+/// Public because directives are a format contract shared with exporters.
+pub fn directive<'a>(trimmed: &'a str, name: &str) -> Option<&'a str> {
     let body = trimmed.strip_prefix("<!--")?.trim_start();
     let rest = body.strip_prefix(name)?.strip_prefix(':')?;
     rest.strip_suffix("-->")
@@ -718,6 +867,19 @@ fn rewrite_image_attrs(line: &str) -> String {
             break;
         };
         let group_end = attrs_start + close + 1;
+        // An empty (or whitespace-only) group — `![](x.png){}` — is a
+        // no-op, not a malformed one: strip it outright rather than
+        // falling into the "unrecognized, leave as literal text" case
+        // below, which would leave a stray `{}` in the rendered text *and*
+        // make the line no longer end in `)`, silently breaking a pending
+        // `<!-- highlight: … -->`'s attachment to this image (it splices
+        // the `hl:N` token in just before the closing paren).
+        let is_empty = out[attrs_start..attrs_start + close].trim().is_empty();
+        if is_empty {
+            out.replace_range(start..group_end, ")");
+            from = start + 1;
+            continue;
+        }
         match encode_image_attrs(&out[attrs_start..attrs_start + close]) {
             Some(encoded) => {
                 let replacement = format!("#preso-img={encoded})");
@@ -760,6 +922,51 @@ fn encode_image_attrs(spec: &str) -> Option<String> {
     Some(encoded.join("+"))
 }
 
+/// Sentinel prefixed to `==marked==` text when it is rewritten into an
+/// inline-code span (the only inline construct the markdown widget can
+/// give a background). The renderer strips it and restyles the span as a
+/// text highlight instead of code. A private-use codepoint so it can't
+/// collide with slide content. Public because it is a format contract
+/// shared with the renderer and exporters.
+pub const MARK_SENTINEL: char = '\u{E000}';
+
+/// Replace `==marked==` text with sentinel-tagged inline code
+/// (`` `\u{E000}marked` ``) so the renderer can restyle it as a text
+/// highlight. Same conservative heuristics as inline math: an even number
+/// of `==` on the line, and each marked segment non-empty, free of
+/// backticks, with no leading/trailing whitespace (so `a == b` stays
+/// prose).
+fn replace_marks(line: &str) -> String {
+    if !line.contains("==") {
+        return line.to_string();
+    }
+    let segments: Vec<&str> = line.split("==").collect();
+    // segments alternate: text, mark, text, mark, ... text
+    if segments.len().is_multiple_of(2) {
+        return line.to_string(); // odd number of `==`
+    }
+    let valid = segments
+        .iter()
+        .skip(1)
+        .step_by(2)
+        .all(|m| !m.is_empty() && m.trim() == *m && !m.contains('`'));
+    if !valid {
+        return line.to_string();
+    }
+    let mut out = String::with_capacity(line.len());
+    for (i, segment) in segments.iter().enumerate() {
+        if i % 2 == 1 {
+            out.push('`');
+            out.push(MARK_SENTINEL);
+            out.push_str(segment);
+            out.push('`');
+        } else {
+            out.push_str(segment);
+        }
+    }
+    out
+}
+
 /// Replace inline `$x^2$` math with inline-code styling so the markdown
 /// renderer shows it distinctly. Conservative heuristics: the line must
 /// contain an even number of `$`, and a math segment must be non-empty
@@ -791,15 +998,18 @@ fn replace_inline_math(line: &str) -> String {
     out
 }
 
-enum NoteOpen {
-    /// `<!-- note: text -->` on one line.
+/// A recognized speaker-note comment opener. Public because notes are a
+/// format contract shared with exporters, which must collect the same
+/// multi-line continuations the parser does.
+pub enum NoteOpen {
+    /// `<!-- note: text -->` on one line: `(step, text)`.
     Complete(Option<usize>, String),
     /// `<!-- note: text` — closes on a later line.
     Continued(Option<usize>, String),
 }
 
 /// Recognize `<!-- note: -->`, `<!-- speaker: -->`, `<!-- note[n]: -->`.
-fn parse_note_open(trimmed: &str) -> Option<NoteOpen> {
+pub fn parse_note_open(trimmed: &str) -> Option<NoteOpen> {
     let body = trimmed.strip_prefix("<!--")?.trim_start();
     let (step, rest) = if let Some(rest) = body.strip_prefix("speaker:") {
         (None, rest)
@@ -1386,6 +1596,193 @@ mod tests {
     }
 
     #[test]
+    fn highlight_directive_attaches_to_next_image() {
+        use crate::model::HighlightShape;
+        let src = "\
+<!-- highlight: rect x=12% y=40 w=20% h=18% color=#ffd54a opacity=0.5 stroke=3 -->
+![protocol](proto.png)
+";
+        let slide = &parse(src).unwrap().slides[0];
+        assert_eq!(slide.highlights.len(), 1);
+        let h = &slide.highlights[0][0];
+        assert_eq!(h.shape, HighlightShape::Rect);
+        assert_eq!((h.x, h.y, h.w, h.h), (0.12, 0.40, 0.20, 0.18));
+        assert_eq!(h.color.as_deref(), Some("#ffd54a"));
+        assert_eq!(h.opacity, 0.5);
+        assert_eq!(h.stroke, 3.0);
+        assert_eq!(h.step, None);
+        // The comment is stripped; the image carries the group token.
+        assert!(!slide.source.contains("<!-- highlight:"));
+        assert!(
+            slide
+                .source
+                .contains("![protocol](proto.png#preso-img=hl:0)")
+        );
+    }
+
+    #[test]
+    fn highlight_defaults_and_step_gating() {
+        let src = "\
+<!-- highlight: ellipse w=30 h=20 -->
+<!-- highlight[2]: rect x=50 y=50 w=10 h=10 -->
+![p](p.png)
+";
+        let slide = &parse(src).unwrap().slides[0];
+        // Both shapes land in one group on the one image.
+        assert_eq!(slide.highlights.len(), 1);
+        let group = &slide.highlights[0];
+        assert_eq!(group.len(), 2);
+        assert_eq!(group[0].color, None); // theme accent
+        assert_eq!(group[0].opacity, 0.35);
+        assert_eq!(group[0].stroke, 0.0);
+        assert_eq!(group[1].step, Some(2));
+        // The gated shape mints reveal steps even without pauses.
+        assert_eq!(slide.step_count(), 3);
+    }
+
+    #[test]
+    fn highlight_modes() {
+        use crate::model::HighlightMode as M;
+        // `mode=…` and bare flags both work; a plain highlight stays fill.
+        let src = "\
+<!-- highlight: rect x=10 y=10 w=20 h=20 mode=spotlight -->
+<!-- highlight: ellipse x=50 y=50 w=20 h=20 spotlight -->
+<!-- highlight: rect w=5 h=5 under -->
+<!-- highlight: rect w=5 h=5 mode=under opacity=0.6 -->
+<!-- highlight: rect w=5 h=5 -->
+![p](p.png)
+";
+        let group = &parse(src).unwrap().slides[0].highlights[0];
+        assert_eq!(
+            group.iter().map(|h| h.mode).collect::<Vec<_>>(),
+            [M::Spotlight, M::Spotlight, M::Under, M::Under, M::Fill]
+        );
+        // Under defaults to full opacity (an explicit value still wins);
+        // over-image modes stay translucent.
+        assert_eq!(
+            group.iter().map(|h| h.opacity).collect::<Vec<_>>(),
+            [0.35, 0.35, 1.0, 0.6, 0.35]
+        );
+    }
+
+    #[test]
+    fn highlight_clip_flag() {
+        use crate::model::HighlightMode as M;
+        // `clip` is an orthogonal modifier: works with fill and spotlight,
+        // and coexists with a mode token in any order.
+        let src = "\
+<!-- highlight: rect w=20 h=20 clip -->
+<!-- highlight: rect w=20 h=20 clip spotlight -->
+<!-- highlight: rect w=20 h=20 mode=spotlight color=#fff clip -->
+<!-- highlight: rect w=20 h=20 -->
+![p](p.png)
+";
+        let group = &parse(src).unwrap().slides[0].highlights[0];
+        assert_eq!(
+            group.iter().map(|h| (h.mode, h.clip)).collect::<Vec<_>>(),
+            [
+                (M::Fill, true),
+                (M::Spotlight, true),
+                (M::Spotlight, true),
+                (M::Fill, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn highlight_joins_existing_image_attrs() {
+        let src = "<!-- highlight: rect w=10 h=10 -->\n![a](x.png){width=40% border}\n";
+        let slide = &parse(src).unwrap().slides[0];
+        assert!(
+            slide
+                .source
+                .contains("![a](x.png#preso-img=width:40+border+hl:0)")
+        );
+    }
+
+    #[test]
+    fn highlight_attaches_past_an_empty_attribute_group() {
+        // `{}` (e.g. left over from an editor/converter) is a no-op, not an
+        // unrecognized group — it must not swallow a pending highlight.
+        let src = "<!-- highlight: rect w=10 h=10 -->\n![a](x.png){}\n";
+        let slide = &parse(src).unwrap().slides[0];
+        assert_eq!(slide.highlights.len(), 1);
+        assert!(slide.source.contains("![a](x.png#preso-img=hl:0)"));
+        assert!(!slide.source.contains('{'));
+    }
+
+    #[test]
+    fn highlight_attaches_to_first_image_of_a_row() {
+        let src = "<!-- highlight: rect w=10 h=10 -->\n![a](x.png)\n![b](y.png)\n";
+        let slide = &parse(src).unwrap().slides[0];
+        assert_eq!(slide.highlights.len(), 1);
+        let row = &slide.image_rows[0];
+        assert_eq!(row.images[0].url, "x.png#preso-img=hl:0");
+        assert_eq!(row.images[1].url, "y.png");
+    }
+
+    #[test]
+    fn highlight_groups_are_per_image() {
+        let src = "\
+<!-- highlight: rect w=10 h=10 -->
+![a](x.png)
+
+<!-- highlight: circle x=5 y=5 w=20 h=20 -->
+![b](y.png)
+";
+        let slide = &parse(src).unwrap().slides[0];
+        assert_eq!(slide.highlights.len(), 2);
+        assert!(slide.source.contains("![a](x.png#preso-img=hl:0)"));
+        assert!(slide.source.contains("![b](y.png#preso-img=hl:1)"));
+    }
+
+    #[test]
+    fn malformed_highlights_are_dropped() {
+        // No shape, zero area, bad coordinate, and no trailing image: none
+        // of these should produce a group (or panic).
+        for src in [
+            "<!-- highlight: x=10 y=10 w=10 h=10 -->\n![a](x.png)\n",
+            "<!-- highlight: rect x=10 y=10 -->\n![a](x.png)\n",
+            "<!-- highlight: rect w=nope h=10 -->\n![a](x.png)\n",
+            "<!-- highlight: rect w=10 h=10 -->\nno image here\n",
+        ] {
+            let slide = &parse(src).unwrap().slides[0];
+            assert!(slide.highlights.is_empty(), "src: {src:?}");
+            assert!(!slide.source.contains("hl:"), "src: {src:?}");
+        }
+    }
+
+    #[test]
+    fn marks_become_sentinel_tagged_inline_code() {
+        use super::MARK_SENTINEL as S;
+        let slide = &parse("The ==key point== stands out\n").unwrap().slides[0];
+        assert_eq!(slide.source, format!("The `{S}key point` stands out\n"));
+        // Multiple marks on one line, and marks inside bullets/headings.
+        let slide = &parse("- ==a== and ==b==\n\n## A ==marked== heading\n")
+            .unwrap()
+            .slides[0];
+        assert!(slide.source.contains(&format!("- `{S}a` and `{S}b`")));
+        assert!(slide.source.contains(&format!("## A `{S}marked` heading")));
+    }
+
+    #[test]
+    fn non_marks_stay_prose() {
+        for src in [
+            "if a == b {}\n",            // single `==`: comparison, not a mark
+            "x == y == z\n",             // inner segments have spaces
+            "== leading space ==\n",     // whitespace-trimmed segments
+            "a ====\n",                  // empty segment
+            "`code == here` twice ==\n", // backtick guard
+        ] {
+            let slide = &parse(src).unwrap().slides[0];
+            assert!(!slide.source.contains(super::MARK_SENTINEL), "src: {src:?}");
+        }
+        // Fenced code is untouched even with mark-shaped content.
+        let slide = &parse("```rust\nlet ok = a ==b== c;\n```\n").unwrap().slides[0];
+        assert!(slide.source.contains("a ==b== c"));
+    }
+
+    #[test]
     fn hidden_slides_are_dropped_from_the_deck() {
         let src = "\
 # One
@@ -1717,6 +2114,19 @@ mod tests {
         // Unknown flags leave the whole group as literal text.
         let deck = parse("![c](z.png){sparkles}\n").unwrap();
         assert!(deck.slides[0].source.contains("{sparkles}"));
+    }
+
+    #[test]
+    fn empty_image_attr_group_is_stripped_not_literal() {
+        // `{}` (and whitespace-only `{ }`) is a no-op, not "unrecognized" —
+        // unlike a malformed group, it must not survive into the text flow.
+        // Blank lines keep these as standalone images rather than a row, so
+        // `source` holds the raw (rewritten) markdown to check directly.
+        let deck = parse("![a](x.png){}\n\n![b](y.png){ }\n").unwrap();
+        let source = &deck.slides[0].source;
+        assert!(source.contains("![a](x.png)"));
+        assert!(source.contains("![b](y.png)"));
+        assert!(!source.contains('{'));
     }
 
     #[test]

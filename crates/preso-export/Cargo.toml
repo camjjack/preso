@@ -16,4 +16,11 @@ publish = false
 lopdf = { version = "0.42", default-features = false, features = ["time"] }
 image = { workspace = true }
 flate2 = "1"
+# Bitmap .pptx export: an OOXML zip with one full-bleed picture per slide.
+zip = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+# The pptx round-trip test reads exports back with preso's own importer.
+preso-convert = { path = "../preso-convert" }
+preso-core = { workspace = true }

@@ -2,7 +2,7 @@ mod app;
 mod audience;
 mod export;
 mod hot_reload;
-mod include;
+
 mod keyboard;
 mod media;
 mod monitors;
@@ -48,22 +48,27 @@ struct Cli {
     #[arg(long, value_name = "OUTPUT")]
     export_pdf: Option<std::path::PathBuf>,
 
-    /// With --export-pdf: one page per reveal step instead of one fully
+    /// Export the deck to a PowerPoint file (each slide one full-bleed
+    /// image, rendered exactly as presented — not editable text) and exit
+    #[arg(long, value_name = "OUTPUT", conflicts_with = "export_pdf")]
+    export_pptx: Option<std::path::PathBuf>,
+
+    /// With an export: one page/slide per reveal step instead of one fully
     /// revealed page per slide
     #[arg(long)]
     export_steps: bool,
 
     /// With --export-pdf: handout layout, two slides per A4 page
-    #[arg(long = "export-2up")]
+    #[arg(long = "export-2up", conflicts_with = "export_pptx")]
     export_two_up: bool,
 
-    /// With --export-pdf: pixel width of each rendered slide (height follows
+    /// With an export: pixel width of each rendered slide (height follows
     /// 16:9). Lower = smaller file. Default 1600 (slides render at 3840 and are
     /// downscaled to this).
     #[arg(long, value_name = "PX", default_value_t = 1600)]
     export_width: u32,
 
-    /// With --export-pdf: JPEG quality 1–100 for the embedded slide images.
+    /// With an export: JPEG quality 1–100 for the embedded slide images.
     /// Lower = smaller file. Default 70.
     #[arg(long, value_name = "1-100", default_value_t = 70)]
     export_quality: u8,
@@ -165,7 +170,7 @@ fn main() -> anyhow::Result<()> {
         .file
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."));
-    let source = include::expand(&source, deck_dir)?;
+    let source = preso_core::include::expand(&source, deck_dir)?;
 
     // Theme priority: CLI flag > frontmatter > default (dark).
     let theme_name = cli.theme.clone().or_else(|| {
@@ -182,11 +187,35 @@ fn main() -> anyhow::Result<()> {
     warn_missing_font_families(&theme, &theme_fonts);
 
     // Headless export: render offscreen and exit, no windows at all.
-    if let Some(out) = &cli.export_pdf {
+    let export_target = cli
+        .export_pdf
+        .as_ref()
+        .map(|out| {
+            (
+                out,
+                export::Format::Pdf {
+                    two_up: cli.export_two_up,
+                },
+            )
+        })
+        .or_else(|| {
+            cli.export_pptx
+                .as_ref()
+                .map(|out| (out, export::Format::Pptx))
+        });
+    if let Some((out, format)) = export_target {
         if std::env::var_os("ICED_TEST_BACKEND").is_none() {
             // SAFETY: before any other thread exists.
             unsafe { std::env::set_var("ICED_TEST_BACKEND", "tiny-skia") };
         }
+        // An export run renders only through the Simulator, so the *test*
+        // backend is the real one. Mirror it into ICED_BACKEND so backend
+        // detection (`overlay::software_renderer`, used by the canvas
+        // transform workarounds) tells the truth; no window ever opens here.
+        let test_backend =
+            std::env::var("ICED_TEST_BACKEND").unwrap_or_else(|_| "tiny-skia".into());
+        // SAFETY: before any other thread exists.
+        unsafe { std::env::set_var("ICED_BACKEND", test_backend) };
         return export::run(
             &source,
             &cli.file,
@@ -195,9 +224,9 @@ fn main() -> anyhow::Result<()> {
             out,
             export::Options {
                 steps: cli.export_steps,
-                two_up: cli.export_two_up,
                 width: cli.export_width,
                 quality: f32::from(cli.export_quality.clamp(1, 100)) / 100.0,
+                format,
             },
         );
     }

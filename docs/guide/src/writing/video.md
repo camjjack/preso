@@ -22,10 +22,12 @@ There are two ways the clip plays, depending on how preso was built:
   `--software`. See [External playback](#external-playback).
 
 In both cases the slide shows a centered ▶ play badge (also in the presenter
-preview and the exported PDF), and the presenter status line shows
-`▶ V: play video`. There's no automatic thumbnail, so add your own poster — an
-`![](…)` image or a full-bleed [`background=`](images.md#full-bleed-backgrounds)
-— to fill the frame; inline playback draws the video over it.
+preview and the exported PDF). While an inline clip is playing, the presenter's
+badge and status line switch to ⏸ (`⏸ V: pause video`) so you can tell at a
+glance that it's running on the audience window. There's no automatic
+thumbnail, so add your own poster — an `![](…)` image or a full-bleed
+[`background=`](images.md#full-bleed-backgrounds) — to fill the frame; inline
+playback draws the video over it.
 
 ## Inline playback
 
@@ -53,15 +55,33 @@ Inline video uses [`iced_video_player`](https://crates.io/crates/iced_video_play
    the GStreamer libraries, so this build is for people who have them (or a
    bundled distribution) — the plain binary stays dependency-free.
 
-The clip loads lazily on the **first** <kbd>v</kbd> press (so paging past video
-slides never pays the GStreamer decode cost), then plays; press <kbd>v</kbd>
-again to pause and resume. Until then the slide shows the poster + ▶ badge.
-Leaving the slide stops and unloads the clip.
+Every clip in the deck is **preloaded when the deck loads** (and prerolled, so
+the first frame is ready), rather than on demand — so the first press plays
+instantly instead of stalling mid-talk while GStreamer builds the pipeline. The
+clips stay paused until you start them; until then the slide shows the poster +
+▶ badge. Editing the deck reloads only clips it newly references, so the
+authoring loop doesn't re-pay the cost.
 
-> The first ever inline load after installing GStreamer is slow — GStreamer
-> builds its plugin registry once (cached afterwards), and may print harmless
-> warnings to the terminal (missing GObject-introspection typelibs, duplicate
-> GTK classes from the bundled plugins). Neither affects playback.
+Controls (on the slide's clip):
+
+| Key | Action |
+|-----|--------|
+| <kbd>Space</kbd> or <kbd>v</kbd> | Play / pause |
+| <kbd>←</kbd> | While playing, scrub back a few seconds |
+| <kbd>⌥</kbd><kbd>←</kbd> | While playing, rewind to the start |
+
+Leaving the slide stops the clip (it stays loaded). While a clip plays the
+presenter's badge and status line show the ⏸ / rewind hints; the audience just
+sees the video over the slide. Because <kbd>Space</kbd> controls the clip on a
+video slide, advance with <kbd>→</kbd> / <kbd>PageDown</kbd> and step back with
+<kbd>PageUp</kbd> / <kbd>Backspace</kbd> / <kbd>↑</kbd>.
+
+> Preloading trades a little launch time and memory (all pipelines are held at
+> once) for a freeze-free presentation. The first launch after installing
+> GStreamer is slower still — GStreamer builds its plugin registry once (cached
+> afterwards), and may print harmless warnings to the terminal (missing
+> GObject-introspection typelibs, duplicate GTK classes from the bundled
+> plugins). Neither affects playback.
 
 ## External playback
 

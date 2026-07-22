@@ -1,7 +1,9 @@
-//! Headless PDF export: render every page offscreen with iced_test's
-//! Simulator at a fixed 1920×1080 logical canvas. Snapshots come back at
-//! 2× scale (3840×2160 ≈ 288 DPI on a 13.33in page) regardless of the
-//! user's screen — no window is opened at all.
+//! Headless document export (PDF or bitmap PowerPoint): render every page
+//! offscreen with iced_test's Simulator at a fixed 1920×1080 logical
+//! canvas, then hand the captured frames to `preso-export`'s assembler for
+//! the chosen format. Snapshots come back at 2× scale (3840×2160 ≈ 288 DPI
+//! on a 13.33in page) regardless of the user's screen — no window is
+//! opened at all.
 
 use crate::media::Media;
 use crate::render::{self, SlideContext};
@@ -13,14 +15,24 @@ use std::path::Path;
 const CANVAS_WIDTH: f32 = 1920.0;
 const CANVAS_HEIGHT: f32 = 1080.0;
 
-/// PDF export tuning (mostly file size). `width` downscales each rendered
+/// Which document the captured pages are assembled into.
+pub enum Format {
+    Pdf {
+        two_up: bool,
+    },
+    /// PowerPoint, one full-bleed picture per slide — pixel-faithful,
+    /// not editable text.
+    Pptx,
+}
+
+/// Export tuning (mostly file size). `width` downscales each rendered
 /// slide (iced_test always renders at 3840×2160); `quality` is the embedded
-/// JPEG quality (0..1).
+/// JPEG quality (0..1) where JPEG wins the per-slide codec choice.
 pub struct Options {
     pub steps: bool,
-    pub two_up: bool,
     pub width: u32,
     pub quality: f32,
+    pub format: Format,
 }
 
 /// A two-column slide split: (markdown, sub-slide metadata) per side.
@@ -39,9 +51,9 @@ pub fn run(
 ) -> anyhow::Result<()> {
     let Options {
         steps,
-        two_up,
         width,
         quality,
+        format,
     } = options;
     let parsed = preso_core::parser::parse(source).context("parse deck")?;
     let media = Media::new(deck_path);
@@ -122,12 +134,19 @@ pub fn run(
         .title
         .clone()
         .unwrap_or_else(|| deck_path.display().to_string());
-    let layout = if two_up {
-        preso_export::Layout::TwoUp
-    } else {
-        preso_export::Layout::Slides
-    };
-    preso_export::write_pdf(&title, &pages, out, layout, quality).context("write PDF")?;
+    match format {
+        Format::Pdf { two_up } => {
+            let layout = if two_up {
+                preso_export::Layout::TwoUp
+            } else {
+                preso_export::Layout::Slides
+            };
+            preso_export::write_pdf(&title, &pages, out, layout, quality).context("write PDF")?;
+        }
+        Format::Pptx => {
+            preso_export::write_pptx(&title, &pages, out, quality).context("write PPTX")?;
+        }
+    }
     let _ = std::fs::remove_dir_all(&tmp);
     println!("exported {} page(s) to {}", pages.len(), out.display());
     Ok(())
@@ -155,6 +174,11 @@ fn page_element<'a>(
                 animation_time: std::time::Duration::ZERO,
                 halign: render::resolve_halign(&slide.overrides, theme),
                 step,
+                // iced_test's Simulator always snapshots at 2×, and the
+                // tiny-skia offset bug scales with that factor (see
+                // `overlay::compensated_frame`).
+                scale_factor: 2.0,
+                authoring: false,
             },
         )
     };
@@ -193,6 +217,7 @@ fn page_element<'a>(
             footnote: slide.footnote.clone(),
             layer_images: slide.layer_images.clone(),
             video: slide.video.is_some(),
+            video_playing: false,
             // Dither noise defeats the JPEG page compression (~14x
             // larger files); pages keep iced's plain gradient.
             dither: false,

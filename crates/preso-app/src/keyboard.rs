@@ -7,6 +7,14 @@ pub enum Action {
     Prev,
     First,
     Last,
+    /// Spacebar: play/pause an inline video on the current slide, else `Next`.
+    /// Resolved in the app, which knows whether the slide has a loaded clip.
+    Space,
+    /// Left arrow: rewind/scrub a *playing* inline video (`alt` = full rewind
+    /// to the start, else scrub back), else `Prev`. Resolved in the app.
+    Left {
+        alt: bool,
+    },
     /// 1-based slide number from `<digits><Enter>`.
     Jump(usize),
     ToggleFullscreen,
@@ -19,6 +27,9 @@ pub enum Action {
     TogglePen,
     /// `C`: clear pen annotations.
     ClearAnnotations,
+    /// `H`: toggle highlight-author mode (drag a box on an image to copy a
+    /// `<!-- highlight: … -->` directive).
+    ToggleHighlightAuthor,
     /// `V`: play the current slide's `<!-- video: … -->` clip in an external
     /// fullscreen player.
     PlayVideo,
@@ -34,7 +45,7 @@ pub enum Action {
 /// open), Home/End/PageUp/PageDown scroll the grid instead of navigating the
 /// deck; the arrow keys still move the highlighted slide.
 pub fn action(event: &Event, jump_buffer: &mut String, overview: bool) -> Option<Action> {
-    let Event::KeyPressed { key, .. } = event else {
+    let Event::KeyPressed { key, modifiers, .. } = event else {
         return None;
     };
     if overview {
@@ -60,11 +71,21 @@ pub fn action(event: &Event, jump_buffer: &mut String, overview: bool) -> Option
         }
     }
     match key.as_ref() {
-        Key::Named(Named::ArrowRight | Named::ArrowDown | Named::Space | Named::PageDown) => {
+        Key::Named(Named::Space) => {
+            jump_buffer.clear();
+            Some(Action::Space)
+        }
+        Key::Named(Named::ArrowLeft) => {
+            jump_buffer.clear();
+            Some(Action::Left {
+                alt: modifiers.alt(),
+            })
+        }
+        Key::Named(Named::ArrowRight | Named::ArrowDown | Named::PageDown) => {
             jump_buffer.clear();
             Some(Action::Next)
         }
-        Key::Named(Named::ArrowLeft | Named::ArrowUp | Named::Backspace | Named::PageUp) => {
+        Key::Named(Named::ArrowUp | Named::Backspace | Named::PageUp) => {
             jump_buffer.clear();
             Some(Action::Prev)
         }
@@ -104,6 +125,10 @@ pub fn action(event: &Event, jump_buffer: &mut String, overview: bool) -> Option
         Key::Character("c") => {
             jump_buffer.clear();
             Some(Action::ClearAnnotations)
+        }
+        Key::Character("h") => {
+            jump_buffer.clear();
+            Some(Action::ToggleHighlightAuthor)
         }
         Key::Character("v") => {
             jump_buffer.clear();

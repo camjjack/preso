@@ -44,6 +44,9 @@ resvg = "0.46"
 # snapshots), GIF (animations), JPEG (`.jpg` backgrounds). Drops webp/exr/
 # tiff/bmp/ico/etc. decoders that `image`'s defaults would pull in.
 image = { version = "0.25", default-features = false, features = ["png", "gif", "jpeg"] }
+# OOXML zips (pptx import in preso-convert, pptx export in preso-export).
+# Deflate only: pptx never uses bzip2/zstd/aes.
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [profile.release]
 # Size-tuned: fat LTO + single codegen unit maximize cross-crate dead-code

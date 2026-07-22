@@ -122,6 +122,14 @@ pub struct App {
     overview_md: Option<Vec<markdown::Content>>,
     /// Laser pointer / pen annotation state (audience window).
     pub pointer: Pointer,
+    /// Highlight-author mode (`H`): the presenter's current slide stacks a
+    /// drag canvas over each image; a drag copies a `<!-- highlight: … -->`
+    /// directive to the clipboard.
+    pub authoring: bool,
+    /// Transient presenter hint (e.g. "highlight copied"), cleared on the
+    /// next navigation or mode toggle. No timer — it just persists until the
+    /// next action, which keeps the logic clock-free (see AGENTS).
+    pub toast: Option<String>,
     timer: Timer,
     clock: Box<dyn Clock>,
     /// CLI `--theme` wins over frontmatter, including on hot reload.
@@ -156,11 +164,13 @@ pub struct App {
     /// Only read in `video`-feature builds.
     #[cfg_attr(not(feature = "video"), allow(dead_code))]
     gpu_active: bool,
-    /// The GStreamer-backed video for the current slide (when built with the
-    /// `video` feature, wgpu is live, and the slide has a `<!-- video: … -->`).
-    /// Owns the pipeline; dropped/rebuilt as the current slide changes.
+    /// GStreamer-backed videos, keyed by deck-relative path (when built with
+    /// the `video` feature and wgpu is live). Every `<!-- video: … -->` clip
+    /// in the deck is loaded **once, up front** (at deck load / reload) so the
+    /// costly pipeline preroll never stalls the event loop mid-presentation;
+    /// each starts paused and is played/paused by `V`. Owns the pipelines.
     #[cfg(feature = "video")]
-    embedded: Option<crate::video::Embedded>,
+    videos: std::collections::HashMap<String, crate::video::Embedded>,
 }
 
 /// Overview grid layout: thumbnail scale, gap between thumbnails, the room
@@ -353,6 +363,8 @@ impl App {
             overview: false,
             overview_md: None,
             pointer: Pointer::default(),
+            authoring: false,
+            toast: None,
             timer: Timer::new(duration_minutes),
             clock: Box::new(SystemClock),
             theme_override,
@@ -365,9 +377,18 @@ impl App {
             current_has_gif: false,
             gpu_active,
             #[cfg(feature = "video")]
-            embedded: None,
+            videos: std::collections::HashMap::new(),
         };
         app.refresh_markdown();
+        // Run the talk clock from launch so it's visible and counting straight
+        // away (press `r` at the real start to zero it) — rather than staying
+        // blank until the first slide change.
+        app.timer.start_if_needed(app.clock.now());
+        // Load every clip up front so the first play is instant (see
+        // `preload_videos`). Runs before the windows appear, so the preroll
+        // cost is part of launch, not the presentation.
+        #[cfg(feature = "video")]
+        app.preload_videos();
         (app, Task::batch(tasks))
     }
 
@@ -401,8 +422,6 @@ impl App {
                 .and_then(|s| s.column_slides(s.step_count().saturating_sub(1)))
         }
         .map(columns_of);
-        #[cfg(feature = "video")]
-        self.sync_embedded_video();
     }
 
     /// The current slide as a themed element: single column or two-column
@@ -417,15 +436,23 @@ impl App {
         }
     }
 
-    pub fn current_slide_element(&self, scale: f32, inert: bool) -> Element<'_, Message> {
+    pub fn current_slide_element(
+        &self,
+        scale: f32,
+        scale_factor: f32,
+        inert: bool,
+        authoring: bool,
+    ) -> Element<'_, Message> {
         let slide = self.deck.current_slide();
         self.slide_body(
             slide,
             &self.current_md,
             self.current_cols.as_ref(),
             scale,
+            scale_factor,
             self.deck.current_step(),
             inert,
+            authoring,
         )
     }
 
@@ -434,14 +461,17 @@ impl App {
     /// band. Shared by the audience/main view, the presenter "Next" preview,
     /// and the overview thumbnails so all three render two-column slides the
     /// same way. `inert` renders links non-interactive.
+    #[allow(clippy::too_many_arguments)]
     fn slide_body<'a>(
         &'a self,
         slide: &'a preso_core::Slide,
         content: &'a markdown::Content,
         cols: Option<&'a (Column, Column)>,
         scale: f32,
+        scale_factor: f32,
         step: usize,
         inert: bool,
+        authoring: bool,
     ) -> Element<'a, Message> {
         let render_one = |content, code_slide| {
             let ctx = SlideContext {
@@ -453,6 +483,8 @@ impl App {
                 animation_time: self.animation_time(),
                 halign: render::resolve_halign(&slide.overrides, self.slide_theme(slide)),
                 step,
+                scale_factor,
+                authoring,
             };
             if inert {
                 render::slide_inert(content, ctx)
@@ -526,8 +558,10 @@ impl App {
                         content,
                         cols,
                         SCALE,
+                        self.presenter_scale_factor(),
                         slide.step_count().saturating_sub(1),
                         true,
+                        false,
                     );
                     let surface = render::slide_surface(
                         body,
@@ -544,6 +578,7 @@ impl App {
                             footnote: slide.footnote.clone(),
                             layer_images: slide.layer_images.clone(),
                             video: slide.video.is_some(),
+                            video_playing: false,
                             dither: true,
                         },
                     );
@@ -630,7 +665,16 @@ impl App {
         scale: f32,
         step: usize,
     ) -> Element<'a, Message> {
-        let body = self.slide_body(slide, content, self.next_cols.as_ref(), scale, step, false);
+        let body = self.slide_body(
+            slide,
+            content,
+            self.next_cols.as_ref(),
+            scale,
+            self.presenter_scale_factor(),
+            step,
+            false,
+            false,
+        );
         render::slide_surface(
             body,
             &self.media,
@@ -643,6 +687,7 @@ impl App {
                 footnote: slide.footnote.clone(),
                 layer_images: slide.layer_images.clone(),
                 video: slide.video.is_some(),
+                video_playing: false,
                 dither: true,
             },
         )
@@ -657,6 +702,13 @@ impl App {
 
     pub fn window_scale_factor(&self, id: window::Id) -> f32 {
         self.scale_factors.get(&id).copied().unwrap_or(1.0)
+    }
+
+    /// DPI factor of the presenter window (`1.0` before it opens), for
+    /// slide bodies rendered into its previews and overview grid.
+    fn presenter_scale_factor(&self) -> f32 {
+        self.presenter_id()
+            .map_or(1.0, |id| self.window_scale_factor(id))
     }
 
     fn audience_id(&self) -> Option<window::Id> {
@@ -755,6 +807,13 @@ impl App {
                 Task::none()
             }
             Message::LinkClicked(uri) => {
+                // A drag in highlight-author mode arrives as a synthetic URI
+                // (see `render::HighlightAuthor`): turn it into a directive on
+                // the clipboard rather than opening a browser.
+                if let Some(directive) = render::author_directive(&uri) {
+                    self.toast = Some(format!("copied  {directive}"));
+                    return iced::clipboard::write(directive);
+                }
                 tracing::info!(%uri, "opening link in system browser");
                 if let Err(e) = open::that_detached(&uri) {
                     tracing::warn!(%uri, error = %e, "failed to open link");
@@ -988,7 +1047,7 @@ impl App {
         let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
         let deck = std::fs::read_to_string(&path)
             .map_err(|e| format!("cannot read {}: {e}", path.display()))
-            .and_then(|source| crate::include::expand(&source, dir).map_err(|e| e.to_string()))
+            .and_then(|source| preso_core::include::expand(&source, dir).map_err(|e| e.to_string()))
             .and_then(|source| {
                 Deck::from_source(&source).map_err(|e| format!("{}: {e}", path.display()))
             });
@@ -1037,12 +1096,17 @@ impl App {
     /// no clean cached frame for the slide we're leaving (very fast navigation,
     /// or a transition still running), we simply cut.
     fn navigate(&mut self, nav: Nav) -> Task<Message> {
+        // A transient author hint belongs to the slide it was raised on.
+        self.toast = None;
         let before = (self.deck.current_index(), self.deck.current_step());
         self.apply_nav(nav);
         // Snap any in-flight transition; a new one starts only on a real slide
         // change with a matching cached outgoing frame.
         self.transition = None;
         if self.deck.current_index() != before.0 {
+            // Leaving a slide stops any clip that was playing on it.
+            #[cfg(feature = "video")]
+            self.pause_all_videos();
             let kind = self.current_transition_kind();
             if kind != crate::transition::Kind::None
                 && let Some((idx, step, handle)) = &self.frame_cache
@@ -1066,18 +1130,12 @@ impl App {
         self.overview_scroll_task()
     }
 
-    /// Mutate the deck for a navigation (and clear pen strokes / start the
-    /// talk timer as the old per-action handlers did).
+    /// Mutate the deck for a navigation. (The talk timer runs from launch, so
+    /// navigation no longer needs to start it.)
     fn apply_nav(&mut self, nav: Nav) {
         match nav {
-            Nav::Next => {
-                self.timer.start_if_needed(self.clock.now());
-                self.deck.next();
-            }
-            Nav::Prev => {
-                self.timer.start_if_needed(self.clock.now());
-                self.deck.prev();
-            }
+            Nav::Next => self.deck.next(),
+            Nav::Prev => self.deck.prev(),
             Nav::First => self.deck.first(),
             Nav::Last => self.deck.last(),
             Nav::Goto(index) => self.deck.jump(index),
@@ -1168,25 +1226,15 @@ impl App {
         let Some(rel) = self.deck.current_slide().video.clone() else {
             return;
         };
-        // Inline playback when built with `video` and wgpu is live: load the
-        // pipeline lazily on this first press (so navigating *past* video
-        // slides never pays the GStreamer decode/preroll cost), then toggle
-        // play/pause on subsequent presses.
+        // Inline playback when built with `video` and wgpu is live: the clip
+        // was prerolled at load (see `preload_videos`), so this just toggles
+        // play/pause with no stall. If it isn't in the map (load failed), fall
+        // through to the external player.
         #[cfg(feature = "video")]
-        if self.gpu_active {
-            if self.embedded.as_ref().map(crate::video::Embedded::path) != Some(rel.as_str()) {
-                let path = self.deck_relative(&rel);
-                match crate::video::Embedded::load(rel.clone(), &path) {
-                    Ok(embedded) => self.embedded = Some(embedded),
-                    Err(e) => {
-                        self.embedded = None;
-                        self.error = Some(format!("cannot load video {}: {e}", path.display()));
-                    }
-                }
-            }
-            if let Some(embedded) = self.embedded.as_mut() {
-                embedded.toggle_pause();
-            }
+        if self.gpu_active
+            && let Some(embedded) = self.videos.get_mut(&rel)
+        {
+            embedded.toggle_pause();
             return;
         }
         let path = self.deck_relative(&rel);
@@ -1195,26 +1243,126 @@ impl App {
         }
     }
 
+    /// Spacebar: play/pause an inline clip on the current slide, else advance
+    /// the deck. Only intercepts when inline playback is live and the clip is
+    /// loaded — so on non-video slides (and external/software playback) Space
+    /// keeps advancing. To move past a video slide, use → / PageDown.
+    fn space_key(&mut self) -> Task<Message> {
+        #[cfg(feature = "video")]
+        if self.gpu_active && !self.overview && self.current_video_loaded() {
+            self.play_current_video();
+            return Task::none();
+        }
+        self.navigate(Nav::Next)
+    }
+
+    /// Left arrow: rewind/scrub a *playing* inline clip (`alt`/Option = full
+    /// rewind to the start, else scrub back a few seconds), else go to the
+    /// previous slide. Only a *playing* clip is intercepted, so Left still
+    /// navigates from a video slide's poster; Prev is always also on
+    /// PageUp / Backspace / ↑.
+    fn left_key(&mut self, alt: bool) -> Task<Message> {
+        #[cfg(feature = "video")]
+        if self.gpu_active && !self.overview && self.video_playing() {
+            if let Some(rel) = self.deck.current_slide().video.clone()
+                && let Some(embedded) = self.videos.get_mut(&rel)
+            {
+                embedded.seek_back(alt);
+            }
+            return Task::none();
+        }
+        #[cfg(not(feature = "video"))]
+        let _ = alt;
+        self.navigate(Nav::Prev)
+    }
+
+    /// Whether the current slide's clip is loaded (preloaded into the map).
+    #[cfg(feature = "video")]
+    fn current_video_loaded(&self) -> bool {
+        self.deck
+            .current_slide()
+            .video
+            .as_deref()
+            .is_some_and(|rel| self.videos.contains_key(rel))
+    }
+
     /// The embedded player for the current slide, if one is loaded.
     #[cfg(feature = "video")]
     pub fn embedded_video(&self) -> Option<&iced_video_player::Video> {
-        self.embedded.as_ref().map(crate::video::Embedded::video)
+        self.deck
+            .current_slide()
+            .video
+            .as_deref()
+            .and_then(|rel| self.videos.get(rel))
+            .map(crate::video::Embedded::video)
     }
 
-    /// Drop the embedded player when it no longer matches the current slide
-    /// (navigated away, or wgpu off), which also stops a playing clip. Loading
-    /// is deferred to the first `V` press (see `play_current_video`) so moving
-    /// past video slides stays instant. No-op unless the `video` feature is on.
+    /// Whether the current slide's clip is loaded and actively playing (not
+    /// paused). Drives the play/pause badge and the audience's inline render.
+    /// Always `false` without the `video` feature (external playback has no
+    /// state we can observe).
+    pub fn video_playing(&self) -> bool {
+        #[cfg(feature = "video")]
+        {
+            self.deck
+                .current_slide()
+                .video
+                .as_deref()
+                .and_then(|rel| self.videos.get(rel))
+                .is_some_and(|e| !e.video().paused())
+        }
+        #[cfg(not(feature = "video"))]
+        false
+    }
+
+    /// Load every `<!-- video: … -->` clip in the deck up front (paused),
+    /// keyed by deck-relative path — so the first play never pays the
+    /// GStreamer preroll mid-presentation. Incremental: clips already loaded
+    /// are kept (a text edit's reload doesn't reload them) and clips no longer
+    /// referenced are dropped. No-op unless wgpu is live.
     #[cfg(feature = "video")]
-    fn sync_embedded_video(&mut self) {
-        let current = if self.gpu_active {
-            self.deck.current_slide().video.as_deref()
-        } else {
-            None
-        };
-        let stale = self.embedded.as_ref().map(crate::video::Embedded::path) != current;
-        if stale {
-            self.embedded = None;
+    fn preload_videos(&mut self) {
+        if !self.gpu_active {
+            return;
+        }
+        let wanted: std::collections::HashSet<String> = self
+            .deck
+            .slides()
+            .iter()
+            .filter_map(|s| s.video.clone())
+            .collect();
+        self.videos.retain(|path, _| wanted.contains(path));
+        for rel in wanted {
+            if self.videos.contains_key(&rel) {
+                continue;
+            }
+            let path = self.deck_relative(&rel);
+            match crate::video::Embedded::load(&path) {
+                Ok(embedded) => {
+                    self.videos.insert(rel, embedded);
+                }
+                Err(e) => {
+                    self.error = Some(format!("cannot load video {}: {e}", path.display()));
+                }
+            }
+        }
+    }
+
+    /// Pause every loaded clip — used when leaving a slide so a playing clip
+    /// doesn't keep running (with audio) once it's off screen.
+    #[cfg(feature = "video")]
+    fn pause_all_videos(&mut self) {
+        for embedded in self.videos.values_mut() {
+            embedded.pause();
+        }
+    }
+
+    /// Leave highlight-author mode and drop its hint (used when another mode
+    /// takes over).
+    fn exit_authoring(&mut self) {
+        if self.authoring {
+            self.authoring = false;
+            self.toast = None;
         }
     }
 
@@ -1226,23 +1374,42 @@ impl App {
         match action {
             keyboard::Action::Next => self.navigate(Nav::Next),
             keyboard::Action::Prev => self.navigate(Nav::Prev),
+            keyboard::Action::Space => self.space_key(),
+            keyboard::Action::Left { alt } => self.left_key(alt),
             keyboard::Action::First => self.navigate(Nav::First),
             keyboard::Action::Last => self.navigate(Nav::Last),
             keyboard::Action::Jump(n) => self.navigate(Nav::Goto(n.saturating_sub(1))),
             keyboard::Action::ResetTimer => {
-                self.timer.reset();
+                self.timer.reset(self.clock.now());
                 Task::none()
             }
             keyboard::Action::ToggleLaser => {
                 self.pointer.toggle(PointerMode::Laser);
+                self.exit_authoring();
                 Task::none()
             }
             keyboard::Action::TogglePen => {
                 self.pointer.toggle(PointerMode::Pen);
+                self.exit_authoring();
                 Task::none()
             }
             keyboard::Action::ClearAnnotations => {
                 self.pointer.clear_strokes();
+                Task::none()
+            }
+            keyboard::Action::ToggleHighlightAuthor => {
+                self.authoring = !self.authoring;
+                // Author mode and laser/pen fight over the same drags (and
+                // an active pointer makes the presenter render inert, which
+                // swallows the author canvas's messages), so entering author
+                // mode turns any pointer mode off.
+                if self.authoring {
+                    let mode = self.pointer.mode;
+                    self.pointer.toggle(mode);
+                }
+                self.toast = self
+                    .authoring
+                    .then(|| "highlight author: drag a box on an image".to_string());
                 Task::none()
             }
             keyboard::Action::PlayVideo => {
@@ -1331,7 +1498,7 @@ impl App {
             .path
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."));
-        let source = match crate::include::expand(&source, dir) {
+        let source = match preso_core::include::expand(&source, dir) {
             Ok(source) => source,
             Err(e) => {
                 tracing::warn!(error = %e, "reload include failure, keeping previous deck");
@@ -1347,6 +1514,10 @@ impl App {
                 self.overview_cols = None;
                 self.reload_theme();
                 self.refresh_markdown();
+                // Load any clip the edit newly referenced; already-loaded ones
+                // are kept, so editing text never re-pays the preroll cost.
+                #[cfg(feature = "video")]
+                self.preload_videos();
             }
             Err(e) => {
                 // Keep presenting the old deck; surface the problem.

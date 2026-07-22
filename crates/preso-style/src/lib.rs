@@ -1,7 +1,7 @@
 //! preso-style: theme configuration.
 //!
 //! Themes are TOML files deserialized into a typed [`Theme`]. All sizes are
-//! in **design units** on the 1920×1080 virtual canvas (plan §2); the app
+//! in **design units** on the 1920×1080 virtual canvas; the app
 //! scales them to the actual window. This crate has no GUI dependencies.
 
 pub mod model;

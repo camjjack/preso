@@ -23,6 +23,7 @@ code_background = "#11111b"
 | `link` | Hyperlinks. |
 | `muted` | De-emphasised text — the default slide-number colour, table borders, image borders. |
 | `code_background` | The panel behind code blocks (and the default table header fill). |
+| `mark` | *(optional)* Background of [`==marked==` text](../writing/text-tables.md#highlighted-text); accepts `#rrggbbaa`. Defaults to `accent` at ~35% opacity. |
 
 These are the *defaults* for each role. Many can be overridden in their own
 section — heading colours per level in [`[heading]`](elements.md#headings),

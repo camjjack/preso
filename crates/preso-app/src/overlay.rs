@@ -88,6 +88,45 @@ fn software_renderer() -> bool {
         .get_or_init(|| std::env::var("ICED_BACKEND").is_ok_and(|backend| backend == "tiny-skia"))
 }
 
+/// A canvas frame with the iced 0.14 tiny-skia transform bugs compensated,
+/// for any canvas that doesn't sit at the window origin. Returns the frame
+/// plus the origin every drawn point must be offset by (in frame
+/// coordinates, which DO scale). Shared by the pointer overlay and the
+/// image-highlight overlay; no-op under wgpu and on 1x displays.
+///
+/// Bug 1: the frame's clip rectangle is stored already translated to the
+/// widget bounds (layer.rs `draw_primitive_group`) and then translated
+/// AGAIN at present time (lib.rs composes `clip_bounds * transformation`),
+/// so the clip lands at 2x the widget offset, cutting everything left of
+/// and above it. Starting the clip rect at -bounds makes the double
+/// translation cancel to exactly the canvas rect.
+///
+/// Bug 2: frame coordinates are canvas-local and the renderer translates
+/// the geometry to the widget's bounds — but the tiny-skia backend composes
+/// that translation in physical pixels instead of logical ones (lib.rs
+/// draws primitive groups with `transformation * scale(scale_factor)`, so
+/// the offset misses the DPI scale): geometry lands at
+/// bounds/scale_factor. The returned origin adds the missing share of the
+/// offset. Verified by calibration screenshots on 1x and 2x displays.
+pub(crate) fn compensated_frame(
+    renderer: &Renderer,
+    bounds: Rectangle,
+    scale_factor: f32,
+) -> (canvas::Frame, Point) {
+    let frame_bounds = if software_renderer() {
+        Rectangle::new(Point::new(-bounds.x, -bounds.y), bounds.size())
+    } else {
+        Rectangle::with_size(bounds.size())
+    };
+    let frame = canvas::Frame::with_bounds(renderer, frame_bounds);
+    let missing = if software_renderer() {
+        1.0 - 1.0 / scale_factor.max(1.0)
+    } else {
+        0.0
+    };
+    (frame, Point::new(bounds.x * missing, bounds.y * missing))
+}
+
 /// Canvas program drawing the overlay at one window's scale.
 pub struct Overlay<'a> {
     pub pointer: &'a Pointer,
@@ -109,36 +148,8 @@ impl canvas::Program<crate::app::Message> for Overlay<'_> {
         bounds: Rectangle,
         _cursor: mouse::Cursor,
     ) -> Vec<canvas::Geometry> {
-        // Second tiny-skia transform bug: the frame's clip rectangle is
-        // stored already translated to the widget bounds (layer.rs
-        // `draw_primitive_group`) and then translated AGAIN at present
-        // time (lib.rs composes `clip_bounds * transformation`), so the
-        // clip lands at 2x the widget offset, cutting everything left of
-        // and above it. Start the clip rect at -bounds so the double
-        // translation cancels to exactly the canvas rect.
-        let frame_bounds = if software_renderer() {
-            Rectangle::new(Point::new(-bounds.x, -bounds.y), bounds.size())
-        } else {
-            Rectangle::with_size(bounds.size())
-        };
-        let mut frame = canvas::Frame::with_bounds(renderer, frame_bounds);
+        let (mut frame, origin) = compensated_frame(renderer, bounds, self.scale_factor);
         let s = self.scale;
-        // Frame coordinates are canvas-local and the renderer translates
-        // the geometry to the widget's bounds — but iced 0.14's tiny-skia
-        // backend composes that translation in physical pixels instead of
-        // logical ones (lib.rs draws primitive groups with
-        // `transformation * scale(scale_factor)`, so the offset misses the
-        // DPI scale): geometry lands at bounds/scale_factor. Add the
-        // missing share of the offset here, in frame coordinates, which DO
-        // scale. No-op on 1x displays and under wgpu, which composes the
-        // transform correctly. Verified by calibration screenshots on 1x
-        // and 2x displays.
-        let missing = if software_renderer() {
-            1.0 - 1.0 / self.scale_factor.max(1.0)
-        } else {
-            0.0
-        };
-        let origin = Point::new(bounds.x * missing, bounds.y * missing);
         let at = |p: Point| Point::new(origin.x + p.x * s, origin.y + p.y * s);
 
         for stroke in &self.pointer.strokes {

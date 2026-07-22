@@ -17,19 +17,17 @@ pub fn view(app: &App, window: window::Id) -> Element<'_, Message> {
     // overlapping/mis-sized glyphs in BOTH windows).
     let scale = render::quantize_scale(raw);
 
-    // Show the ▶ poster badge when the slide has a video but it isn't playing
-    // inline — i.e. always in non-`video` builds (external player), and when an
-    // embedded player failed to load. When the embedded player is up, it covers
-    // the slide instead, so the badge is suppressed.
-    let show_badge = app.deck.current_slide().video.is_some();
-    #[cfg(feature = "video")]
-    let show_badge = show_badge && app.embedded_video().is_none();
+    // Poster badge: the slide has a clip that isn't currently playing. The
+    // clip is preloaded (paused) on a video slide, so "playing" — not merely
+    // "loaded" — is what hides the badge and shows the video over the slide.
+    let playing = app.video_playing();
+    let show_badge = app.deck.current_slide().video.is_some() && !playing;
 
     // The slide canvas: fixed aspect, themed surface (background/gradient,
     // accent bar, logo) with the content on top. Slide transitions overlay the
     // outgoing frame on top of this live surface (see the end of this fn).
     let surface = render::slide_surface(
-        app.current_slide_element(scale, true),
+        app.current_slide_element(scale, app.window_scale_factor(window), true, false),
         &app.media,
         app.slide_theme(app.deck.current_slide()),
         &app.deck.current_slide().overrides,
@@ -43,15 +41,19 @@ pub fn view(app: &App, window: window::Id) -> Element<'_, Message> {
             footnote: app.deck.current_slide().footnote.clone(),
             layer_images: app.deck.current_slide().layer_images.clone(),
             video: show_badge,
+            // The audience badge only appears while the clip is *not* playing,
+            // so it's always the ▶ poster.
+            video_playing: false,
             dither: true,
         },
     );
 
-    // Embedded video (the `video` feature, wgpu live): the player draws over
-    // the slide content, sized to the canvas. Without the feature it's just
-    // the surface.
+    // Embedded video (the `video` feature, wgpu live): while the clip plays,
+    // the player draws over the slide content, sized to the canvas. Paused/idle
+    // clips aren't mounted — the poster badge stands in — so entering a video
+    // slide shows the affordance, not a frozen first frame.
     #[cfg(feature = "video")]
-    let surface: Element<'_, Message> = match app.embedded_video() {
+    let surface: Element<'_, Message> = match app.embedded_video().filter(|_| playing) {
         Some(video) => stack![
             surface,
             iced_video_player::VideoPlayer::new(video)

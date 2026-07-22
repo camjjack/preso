@@ -6,13 +6,15 @@
 
 pub mod error;
 pub mod fence;
+pub mod include;
 pub mod model;
 pub mod parser;
 pub mod state;
 
 pub use error::ParseError;
 pub use model::{
-    Anchor, CodeBlock, Frontmatter, ImageRef, ImageRow, LayerImage, Layout, MathBlock, Note, Slide,
-    SlideOverrides, Table, TableAlign, display_number, display_total,
+    Anchor, CodeBlock, Frontmatter, Highlight, HighlightMode, HighlightShape, ImageRef, ImageRow,
+    LayerImage, Layout, MathBlock, Note, Slide, SlideOverrides, Table, TableAlign, display_number,
+    display_total,
 };
 pub use state::Deck;

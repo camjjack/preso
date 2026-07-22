@@ -35,7 +35,7 @@
 
 # Going Further
 
-- [Exporting to PDF](exporting.md)
+- [Exporting (PDF & PowerPoint)](exporting.md)
 - [Migrating to preso](migrating.md)
 
 # Reference

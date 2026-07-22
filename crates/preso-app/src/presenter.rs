@@ -48,7 +48,14 @@ pub fn view(app: &App, window: window::Id) -> Element<'_, Message> {
         status.push_str(&format!("  |  jump to: {}", app.jump_buffer));
     }
     if slide.video.is_some() {
-        status.push_str("  |  ▶ V: play video");
+        if app.video_playing() {
+            status.push_str("  |  ▮▮ Space: pause  ◀ ⌥◀: rewind");
+        } else {
+            status.push_str("  |  ▶ Space: play video");
+        }
+    }
+    if app.authoring {
+        status.push_str("  |  ✎ HIGHLIGHT AUTHOR (H)");
     }
 
     let muted = render::color(app.theme.colors.muted);
@@ -75,6 +82,11 @@ pub fn view(app: &App, window: window::Id) -> Element<'_, Message> {
     if status_row.is_empty() {
         status_row.push(text(status).size(14).color(muted).into());
     }
+    // Author-mode hint (drag result or prompt), in accent so it reads as a
+    // transient confirmation rather than chrome.
+    if let Some(hint) = &app.toast {
+        status_row.push(text(format!("  |  {hint}")).size(14).color(accent).into());
+    }
 
     // Just the status line. The error (when present) is overlaid on the
     // slide below rather than taking its own header row, so it never shrinks
@@ -86,7 +98,12 @@ pub fn view(app: &App, window: window::Id) -> Element<'_, Message> {
     // mode is active the markdown renders inert: pen presses should draw,
     // not accidentally open links.
     let surface = render::slide_surface(
-        app.current_slide_element(current_scale, app.pointer.active()),
+        app.current_slide_element(
+            current_scale,
+            app.window_scale_factor(window),
+            app.pointer.active(),
+            app.authoring,
+        ),
         &app.media,
         app.slide_theme(app.deck.current_slide()),
         &app.deck.current_slide().overrides,
@@ -103,12 +120,17 @@ pub fn view(app: &App, window: window::Id) -> Element<'_, Message> {
             footnote: deck.current_slide().footnote.clone(),
             layer_images: deck.current_slide().layer_images.clone(),
             video: deck.current_slide().video.is_some(),
+            // Presenter never renders the clip itself, so the badge is its only
+            // feedback: ⏸ while it plays on the audience window, ▶ otherwise.
+            video_playing: app.video_playing(),
             dither: true,
         },
     );
     // Laser/pen work from here too: positions convert to design space,
-    // so they mirror live on the audience window (and vice versa).
-    let surface: Element<'_, Message> = if app.pointer.visible() {
+    // so they mirror live on the audience window (and vice versa). Suppressed
+    // in author mode: its full-slide mouse_area would swallow drags meant for
+    // the per-image author canvas (leftover strokes can keep `visible()` true).
+    let surface: Element<'_, Message> = if app.pointer.visible() && !app.authoring {
         let overlay = iced::widget::canvas(crate::overlay::Overlay {
             pointer: &app.pointer,
             accent,

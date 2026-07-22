@@ -14,10 +14,15 @@ name = "preso-convert"
 path = "src/main.rs"
 
 [dependencies]
+preso-core = { workspace = true }
+# The editable .pptx exporter renders math/Mermaid/Graphviz to PNG and
+# reads image dimensions for sizing.
+preso-diagram = { workspace = true }
+image = { workspace = true }
 clap = { workspace = true }
 serde_norway = { workspace = true }
 anyhow = { workspace = true }
-# PowerPoint (.pptx) import: a zip of XML. Deflate only (pptx never uses
-# bzip2/zstd/aes), and roxmltree is already in the tree via resvg.
-zip = { version = "2", default-features = false, features = ["deflate"] }
+# PowerPoint (.pptx) import: a zip of XML (roxmltree is already in the
+# tree via resvg).
+zip = { workspace = true }
 roxmltree = "0.20"
