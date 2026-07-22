@@ -511,12 +511,11 @@ pub fn highlight_directive(trimmed: &str) -> Option<(Option<usize>, &str)> {
     let body = trimmed.strip_prefix("<!--")?.trim_start();
     let (step, rest) = if let Some(rest) = body.strip_prefix("highlight:") {
         (None, rest)
-    } else if let Some(rest) = body.strip_prefix("highlight[") {
+    } else {
+        let rest = body.strip_prefix("highlight[")?;
         let close = rest.find("]:")?;
         let n: usize = rest[..close].trim().parse().ok()?;
         (Some(n), &rest[close + 2..])
-    } else {
-        return None;
     };
     Some((step, rest.strip_suffix("-->")?))
 }
@@ -1015,12 +1014,11 @@ pub fn parse_note_open(trimmed: &str) -> Option<NoteOpen> {
         (None, rest)
     } else if let Some(rest) = body.strip_prefix("note:") {
         (None, rest)
-    } else if let Some(rest) = body.strip_prefix("note[") {
+    } else {
+        let rest = body.strip_prefix("note[")?;
         let close = rest.find("]:")?;
         let n: usize = rest[..close].trim().parse().ok()?;
         (Some(n), &rest[close + 2..])
-    } else {
-        return None;
     };
 
     match rest.find("-->") {
