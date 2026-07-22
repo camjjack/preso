@@ -3,6 +3,14 @@ name: Release
 # Builds release binaries for macOS (Apple Silicon + Intel), Linux, and
 # Windows on every `v*` tag, then collects them into a single draft GitHub
 # Release for review before publishing.
+#
+# Releases happen on the PUBLIC repo (camjjack/preso), where Actions minutes
+# are free and where the Homebrew tap reads its assets from. This file is
+# published verbatim to the public mirror, so it also exists on the private
+# repo — hence the `github.repository` guard on every job: a `v*` tag pushed
+# privately (we tag both sides for provenance) must not burn the metered
+# private quota building artifacts nobody consumes. Manual dispatch stays
+# available everywhere so the private repo can still do a build-only dry run.
 on:
   push:
     tags: ["v*"]
@@ -12,10 +20,14 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# Tag-triggered builds run on the public repo only; see the note above.
+run-name: ${{ github.repository == 'camjjack/preso' && 'Release' || 'Release (dry run)' }} ${{ github.ref_name }}
+
 jobs:
   build:
     name: Build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
+    if: github.repository == 'camjjack/preso' || github.event_name == 'workflow_dispatch'
     strategy:
       fail-fast: false
       matrix:
@@ -133,6 +145,7 @@ jobs:
   deb:
     name: Debian package (${{ matrix.variant }})
     runs-on: ubuntu-latest
+    if: github.repository == 'camjjack/preso' || github.event_name == 'workflow_dispatch'
     strategy:
       fail-fast: false
       matrix:
@@ -170,8 +183,9 @@ jobs:
     name: Draft release
     needs: [build, deb]
     runs-on: ubuntu-latest
-    # Only publish a release for an actual tag, not for manual dry runs.
-    if: startsWith(github.ref, 'refs/tags/')
+    # Only publish a release for an actual tag on the public repo — never for
+    # a manual dry run, and never on the private mirror of this workflow.
+    if: startsWith(github.ref, 'refs/tags/') && github.repository == 'camjjack/preso'
     permissions:
       contents: write
     steps:

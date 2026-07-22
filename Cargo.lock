@@ -4116,7 +4116,7 @@ dependencies = [
 
 [[package]]
 name = "preso-app"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -4143,7 +4143,7 @@ dependencies = [
 
 [[package]]
 name = "preso-convert"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -4157,7 +4157,7 @@ dependencies = [
 
 [[package]]
 name = "preso-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "criterion",
  "proptest",
@@ -4168,7 +4168,7 @@ dependencies = [
 
 [[package]]
 name = "preso-diagram"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "layout-rs",
  "mermaid-rs-renderer",
@@ -4182,7 +4182,7 @@ dependencies = [
 
 [[package]]
 name = "preso-export"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "flate2",
  "image",
@@ -4195,7 +4195,7 @@ dependencies = [
 
 [[package]]
 name = "preso-style"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "thiserror 2.0.18",
