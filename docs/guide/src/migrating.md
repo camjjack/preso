@@ -77,7 +77,8 @@ afterwards; text-heavy decks come across well.
 | tables | GitHub-flavoured markdown tables |
 | images | extracted to disk and referenced with `![](…)` |
 | speaker notes | `<!-- note: … -->` |
-| markdown punctuation in text (`C#`, `a_b`, `*`) | escaped, so it renders verbatim |
+| markdown punctuation that would read as formatting (`*`, a leading `#`) | escaped, so it renders verbatim |
+| punctuation that wouldn't (`x86_64`, `[Rn, #4]`, `A -> B`, `C#`) | left as it stands, so the markdown stays readable |
 
 A slide's **kind** and **two-column** split come from its PowerPoint *layout*,
 so they're as reliable as the original deck's use of layouts. For a
@@ -100,8 +101,11 @@ where they sat on the slide — move them where you want them.
 
 **Charts, SmartArt, embedded objects, and the WordArt look** of text are not
 converted — each is reported as a per-slide warning so you know which slides
-need attention. **Vector images** (EMF/WMF/SVG, common for pasted diagrams)
-are skipped too, since preso renders raster images only. Footer, date, and
+need attention. **EMF/WMF vector images** (common for pasted diagrams) are
+skipped too — nothing preso uses can decode them. SVG pictures *do* convert:
+they come across as `.svg` and preso rasterises them at display size, so an
+SVG inserted in PowerPoint stays crisp rather than falling back to the raster
+copy PowerPoint keeps beside it. Footer, date, and
 slide-number placeholders are dropped (preso draws its own). A slide with no
 convertible content at all converts to an empty slide and is dropped on load;
 the warning tells you which.

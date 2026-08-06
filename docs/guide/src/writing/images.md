@@ -8,6 +8,38 @@ Standard markdown image syntax; the path is resolved relative to the deck file:
 ![Architecture](diagrams/architecture.png)
 ```
 
+An **SVG** is rasterised at the size it's drawn, so it stays crisp at any
+scale. One thing to watch for, in files exported from PowerPoint especially:
+if the file hard-codes `width`/`height` with no `viewBox`, that canvas was
+measured for the exact fonts it was authored with. Where a font isn't
+installed here, the substitute is usually wider, the text overruns the
+canvas, and the file's own canvas clips it — an edge sliced off that no
+`{width=NN%}` will fix, because the clipping happens inside the SVG's
+coordinate space. preso warns when it sees this:
+
+```text
+WARN preso::media: SVG content is clipped by the canvas the file itself
+declares (4 past the right, in the file's own units)…  image="ipv4.svg"
+```
+
+Widen `width`/`height` on the `<svg>` element to suit (the coordinates don't
+change, so nothing moves or rescales — there's just room now), or convert the
+text to paths when exporting, which removes the font dependency altogether.
+
+An **animated GIF** plays on the slide, looping. Be aware of what that costs:
+a GIF's frames are stored as deltas but *decode* to the whole canvas, so a
+1920×1018 capture is 7.5 MB a frame however small the file looks — a 70-second
+recording at 30fps wants some 16 GB. preso holds at most 256 MB of frames and
+drops the rest, spreading what it keeps across the whole animation and warning
+you (`preso deck.md` prints it on stderr). The result plays steadily but
+choppily. For a screen recording, convert it to a video instead and use
+[`<!-- video: … -->`](video.md), which plays at full rate from a much smaller
+file:
+
+```sh
+ffmpeg -i capture.gif -movflags +faststart -pix_fmt yuv420p capture.mp4
+```
+
 ### Sizing and framing
 
 Add a `{…}` attribute group to size and frame an image:
@@ -66,6 +98,52 @@ centred as a group — put it on any one image in the row:
 ![before](before.png){width=20% fit}
 ![after](after.png){width=20%}
 ```
+
+### An image with text beside it
+
+Write text **after** an image on the same line and the two render side by
+side, the text vertically centred against the image — an icon with its label,
+say. Consecutive lines stack tight, so a run reads as a list:
+
+```markdown
+![](start.png){width=6%} Start a capture
+![](stop.png){width=6%} Stop a capture — don't forget, or your disk fills up
+![](restart.png){width=6%} Restart a capture
+```
+
+Give the images a `{width=NN%}` and the labels share a left edge: the image
+column takes the widest of them. Without one, each image keeps its natural
+size (capped at half the content width so the label always has room) and each
+label starts right after its own image, so they won't line up.
+
+The label takes the same inline markdown a table cell does — `` `code` ``,
+`**bold**`, `==marks==`, and `<br>` for a second line.
+
+The image doesn't have to come first. Text on either side of it stays beside
+it, so an icon can trail its label or sit mid-sentence:
+
+```markdown
+Launched by the bug icon ![](bug.png){width=4%}
+
+Press ![](f5.png){width=4%} to start debugging
+```
+
+Text *before* the image rules out the shared left edge, though — what starts
+the row is then the text, whose width isn't known until it lays out.
+
+This works inside a list too, where it's most useful: the bullet stays a
+bullet, at whatever nesting level, and only the item's content is laid out as
+image-and-text.
+
+```markdown
+- Launched by the bug icon ![](bug.png){width=4%}
+- ![](f5.png){width=4%} Or press F5
+  - Nested items work the same ![](tip.png){width=4%}
+```
+
+The one line that isn't picked up is one holding **two** images (or an image
+and a link) — that stays ordinary markdown, where the text will break around
+the images.
 
 ## Highlighting parts of an image
 
@@ -235,9 +313,48 @@ doubles as a "text over photo" slide:
 
 ![A full-bleed background slide](../images/background.png)
 
+### Fitting the image
+
+By default the image **covers** the slide: it fills the frame and whatever
+overhangs is cropped. That's what a landscape photo with room to spare wants,
+and what a square one suffers — on a 16:9 slide, cover crops the top and
+bottom away.
+
+`fit=contain` scales the whole picture in instead, so nothing is lost:
+
+```markdown
+<!-- slide: background=diagram.png fit=contain -->
+```
+
+What the picture doesn't reach then shows the theme's background colour. Set
+something else with `fill=`:
+
+```markdown
+<!-- slide: background=diagram.png fit=contain fill=#101418 -->
+```
+
+| `fit=` | Result |
+|--------|--------|
+| `cover` | Fills the slide, crops the overhang. The default. |
+| `contain` (or `fit`) | Scales the whole image in; `fill=` shows around it. |
+| `stretch` (or `fill`) | Stretches to the slide, distorting the image. |
+| `none` | The image's own pixels, centred, neither grown nor shrunk. |
+
+`fill=` applies to any fit that can leave the canvas uncovered, and is ignored
+by `cover`, which never does.
+
+Such a slide shows **no accent bars**. The theme's bars are how it dresses its
+own background, and this slide has replaced the background outright — a band of
+accent colour across a photo reads as a rendering fault rather than a design.
+Dropping them also releases the space they
+[reserve](../theming/chrome.md#accent-bars), so the picture gets the whole
+canvas and the content sits on it rather than around where a bar would be.
+
 To set a background image for the **whole deck** instead of one slide, use the
-theme's `[slide] background_image`. A solid per-slide colour uses the same
-directive with a hex value: `<!-- slide: background=#101418 -->`. See
+theme's `[slide] background_image` — that pairing is the theme author's own, so
+it keeps its bars. A solid per-slide colour uses the same directive with a hex
+value: `<!-- slide: background=#101418 -->`, and keeps its bars too, being the
+theme's own background in another colour. See
 [Slide Chrome](../theming/chrome.md).
 
 ## Positioned images (behind the text)

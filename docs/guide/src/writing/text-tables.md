@@ -132,6 +132,34 @@ the default):
 It applies to the **next** table only, so other tables and the rest of the
 slide keep their normal size.
 
+## One slide that won't fit
+
+When it isn't one table or one listing but the slide as a whole, size the
+slide instead:
+
+```markdown
+<!-- slide: size=24 -->
+
+## Instruction encoding
+
+- Six bullets, a table, and a closing line — all of which have to fit
+```
+
+`NN` is the body text size in [design units](../theming/basics.md#design-units),
+the same units the theme's `fonts.body_size` uses (36 in both built-in
+themes), and the same `size=` that `<!-- table: … -->` and a code fence take.
+
+Everything scales with it, in proportion: headings, code, inline code, and the
+gaps between paragraphs. That keeps the slide's shape — a heading still reads
+as a heading — where shrinking the body text alone would leave a heading
+towering over it.
+
+Images don't move. A picture at `{width=70%}` is 70% of the slide whatever the
+text is doing, so give it a smaller percentage if it needs to come down too.
+
+> 💡 Reach for this when a slide is *slightly* over. A slide that needs
+> `size=16` is usually two slides.
+
 ## Quotes
 
 A markdown blockquote highlights an important line as a **callout**:

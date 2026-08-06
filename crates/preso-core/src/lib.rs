@@ -14,7 +14,7 @@ pub mod state;
 pub use error::ParseError;
 pub use model::{
     Anchor, CodeBlock, Frontmatter, Highlight, HighlightMode, HighlightShape, ImageRef, ImageRow,
-    LayerImage, Layout, MathBlock, Note, Slide, SlideOverrides, Table, TableAlign, display_number,
-    display_total,
+    ImageText, ImageTextRun, LayerImage, Layout, MathBlock, Note, Slide, SlideOverrides, Table,
+    TableAlign, display_number, display_total,
 };
 pub use state::Deck;

@@ -29,6 +29,42 @@ pub struct Raster {
     pub rgba: Vec<u8>,
 }
 
+/// How far an SVG's content spills past the canvas it declares, per side, in
+/// user units — see [`Renderer::svg_overflow`]. All zero when it fits.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Overflow {
+    pub left: f32,
+    pub top: f32,
+    pub right: f32,
+    pub bottom: f32,
+}
+
+impl Overflow {
+    /// Whether any side spills enough to be worth reporting. Content that
+    /// merely *touches* the edge — a border stroke drawn on the boundary,
+    /// which is normal — must not count, so this ignores anything under half
+    /// a user unit.
+    pub fn is_clipped(&self) -> bool {
+        const EPSILON: f32 = 0.5;
+        self.left.max(self.top).max(self.right).max(self.bottom) > EPSILON
+    }
+
+    /// The spilled sides, largest first, as `(side, units)` — for reporting.
+    pub fn sides(&self) -> Vec<(&'static str, f32)> {
+        let mut sides: Vec<(&'static str, f32)> = [
+            ("right", self.right),
+            ("bottom", self.bottom),
+            ("left", self.left),
+            ("top", self.top),
+        ]
+        .into_iter()
+        .filter(|(_, units)| *units > 0.5)
+        .collect();
+        sides.sort_by(|a, b| b.1.total_cmp(&a.1));
+        sides
+    }
+}
+
 /// Renders math and Mermaid sources to SVG and rasterizes SVG to RGBA.
 pub struct Renderer {
     options: resvg::usvg::Options<'static>,
@@ -121,6 +157,31 @@ impl Renderer {
             .map_err(|e| DiagramError::Svg(e.to_string()))?;
         let size = tree.size();
         Ok((size.width(), size.height()))
+    }
+
+    /// How far an SVG's drawn content falls outside the canvas the file
+    /// declares, per side, in user units — measured *after* fonts are
+    /// substituted, which is what usually causes it.
+    ///
+    /// A file that hard-codes `width`/`height` with no `viewBox` (what
+    /// PowerPoint exports) has a canvas measured for the exact fonts it was
+    /// authored with. Substitute a wider face for one this machine hasn't
+    /// got and the text overruns that canvas, and the canvas clips it — the
+    /// author sees an edge sliced off and no reason why, at every size,
+    /// since the clipping happens inside the SVG's own coordinate space.
+    pub fn svg_overflow(&self, svg: &str) -> Result<Overflow, DiagramError> {
+        let tree = resvg::usvg::Tree::from_str(svg, &self.options)
+            .map_err(|e| DiagramError::Svg(e.to_string()))?;
+        let size = tree.size();
+        // The *layer* box, so content a clip path already trims doesn't read
+        // as overflow.
+        let bbox = tree.root().abs_layer_bounding_box();
+        Ok(Overflow {
+            left: (-bbox.left()).max(0.0),
+            top: (-bbox.top()).max(0.0),
+            right: (bbox.right() - size.width()).max(0.0),
+            bottom: (bbox.bottom() - size.height()).max(0.0),
+        })
     }
 
     /// Rasterize an SVG at the given scale factor.
@@ -221,6 +282,57 @@ mod tests {
     fn invalid_graphviz_is_an_error() {
         let r = renderer();
         assert!(r.graphviz_svg("this is not dot {{{{").is_err());
+    }
+
+    #[test]
+    fn overflow_is_measured_against_the_declared_canvas() {
+        let r = renderer();
+        // A rect running 20 units past a 100-wide canvas: the file's own
+        // canvas clips it, and no amount of resizing the image will help.
+        let over = r
+            .svg_overflow(
+                r#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="50">
+                     <rect x="10" y="10" width="110" height="20" fill="black"/>
+                   </svg>"#,
+            )
+            .unwrap();
+        assert!(over.is_clipped());
+        assert_eq!(over.sides(), vec![("right", 20.0)]);
+        assert_eq!(over.left, 0.0);
+
+        // Content that fits raises nothing.
+        let fits = r
+            .svg_overflow(
+                r#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="50">
+                     <rect x="10" y="10" width="50" height="20" fill="black"/>
+                   </svg>"#,
+            )
+            .unwrap();
+        assert!(!fits.is_clipped());
+        assert_eq!(fits.sides(), vec![]);
+
+        // A border stroked *on* the boundary is normal and must stay quiet —
+        // half its width sits outside, which is why the epsilon exists.
+        let border = r
+            .svg_overflow(
+                r#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="50">
+                     <rect x="0.5" y="0.5" width="99" height="49" fill="none"
+                           stroke="black" stroke-width="1"/>
+                   </svg>"#,
+            )
+            .unwrap();
+        assert!(!border.is_clipped(), "{border:?}");
+
+        // Spilling off the top-left counts too, and sides come back largest
+        // first.
+        let corner = r
+            .svg_overflow(
+                r#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="50">
+                     <rect x="-30" y="-5" width="40" height="20" fill="black"/>
+                   </svg>"#,
+            )
+            .unwrap();
+        assert_eq!(corner.sides(), vec![("left", 30.0), ("top", 5.0)]);
     }
 
     #[test]

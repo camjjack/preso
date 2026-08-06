@@ -48,8 +48,14 @@ bar = { side = "bottom", size = 24, color = "#1f6feb" }
 | `side` | `top`, `bottom`, `left`, or `right`. |
 | `size` | Thickness, design units. |
 | `color` | `#rrggbb`. |
-| `reserve` | If `true`, slide content is kept clear of the bar; chrome (logo, number) still draws over it. Default `false`. |
+| `reserve` | If `true`, slide content — and the [footnote](#footnote), which is text too — is kept clear of the bar; chrome (logo, number) still draws over it. Default `false`. |
 | `hidden` | Used in a kind overlay to remove an inherited bar (see below). |
+
+Bars are the theme dressing its own background, so a slide that replaces the
+background with its own image — `<!-- slide: background=photo.jpg -->`, a
+[full-bleed background](../writing/images.md#full-bleed-backgrounds) — shows
+none of them, and reclaims the space they reserve. A background image set here
+in the theme keeps its bars: that pairing is deliberate.
 
 ### Multiple bars
 
@@ -147,6 +153,11 @@ padding_y = 36        # inset from the bottom
 | `color` | Falls back to `colors.muted`. |
 | `padding_x` / `padding_y` | Inset from the sides and bottom, design units. |
 | `hidden` | Used in a kind overlay to drop the footnote (e.g. on title slides). |
+
+The padding is measured from the edge of the space an [accent bar](#accent-bars)
+leaves: a footnote sits *above* a bottom bar that sets `reserve = true`, rather
+than being drawn across it in muted text. A bar that doesn't reserve has said
+it's happy to be drawn over, and the footnote does so as before.
 
 See [Writing Decks → Images](../writing/images.md#crediting-images) for the
 directive itself.

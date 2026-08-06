@@ -9,7 +9,7 @@ use crate::media::Media;
 use crate::render::{self, SlideContext};
 use anyhow::Context as _;
 use iced::Element;
-use iced::widget::{container, markdown, row};
+use iced::widget::markdown;
 use std::path::Path;
 
 const CANVAS_WIDTH: f32 = 1920.0;
@@ -34,12 +34,6 @@ pub struct Options {
     pub quality: f32,
     pub format: Format,
 }
-
-/// A two-column slide split: (markdown, sub-slide metadata) per side.
-type ColumnPair = (
-    (markdown::Content, preso_core::Slide),
-    (markdown::Content, preso_core::Slide),
-);
 
 pub fn run(
     source: &str,
@@ -92,16 +86,17 @@ pub fn run(
         } else {
             slide.step_count() - 1..slide.step_count()
         };
+        // One page standing for the whole slide renders it fully revealed,
+        // which is what a `<!-- pause -->` build wants — but a click-through
+        // code walk (`{2-3|5}`) would land on whatever line the walk finished
+        // on, so the page arrives mid-explanation with an arbitrary line
+        // emphasised. Those blocks start where the audience first sees them
+        // instead. Exporting the steps themselves keeps the walk, since each
+        // stage gets its own page.
+        let code_stage = (!steps).then_some(0);
         for step in step_range {
             let content = markdown::Content::parse(slide.step_source(step));
-            let columns = slide
-                .column_slides(step)
-                .map(|((ls, lslide), (rs, rslide))| {
-                    (
-                        (markdown::Content::parse(&ls), lslide),
-                        (markdown::Content::parse(&rs), rslide),
-                    )
-                });
+            let columns = slide.column_slides(step).map(crate::app::columns_of);
 
             let element = page_element(
                 &content,
@@ -113,7 +108,7 @@ pub fn run(
                     preso_core::display_number(&parsed.slides, slide_index),
                     total,
                 ),
-                step,
+                BuildPoint { step, code_stage },
             );
             let mut simulator = iced_test::simulator::Simulator::with_size(
                 settings.clone(),
@@ -152,15 +147,24 @@ pub fn run(
     Ok(())
 }
 
+/// Which point of a slide's build a page draws: the reveal step, plus the
+/// click-through code stage when the page forces one rather than following
+/// that step (see [`SlideContext::code_stage`]).
+#[derive(Clone, Copy)]
+struct BuildPoint {
+    step: usize,
+    code_stage: Option<usize>,
+}
+
 /// The audience-canvas element at design resolution (scale 1.0).
 fn page_element<'a>(
     content: &'a markdown::Content,
-    columns: Option<&'a ColumnPair>,
+    columns: Option<&'a crate::app::Columns>,
     slide: &'a preso_core::Slide,
     media: &'a Media,
     theme: &'a preso_style::Theme,
     number: (usize, usize),
-    step: usize,
+    at: BuildPoint,
 ) -> Element<'a, crate::app::Message> {
     let render_one = |content, code_slide| {
         render::slide_inert(
@@ -173,7 +177,9 @@ fn page_element<'a>(
                 scale: 1.0,
                 animation_time: std::time::Duration::ZERO,
                 halign: render::resolve_halign(&slide.overrides, theme),
-                step,
+                text_scale: render::resolve_text_scale(&slide.overrides, theme),
+                step: at.step,
+                code_stage: at.code_stage,
                 // iced_test's Simulator always snapshots at 2×, and the
                 // tiny-skia offset bug scales with that factor (see
                 // `overlay::compensated_frame`).
@@ -183,26 +189,13 @@ fn page_element<'a>(
         )
     };
     let body: Element<'a, crate::app::Message> = match columns {
-        Some(((left_md, left_slide), (right_md, right_slide))) => {
-            // Match the on-screen header-band alignment (scale 1.0 here).
-            let (lp, rp) = render::column_header_pads(
-                left_slide.leading_heading_level(),
-                right_slide.leading_heading_level(),
-                theme,
-                1.0,
-            );
-            let (lw, rw) = slide.layout.column_portions().unwrap_or((1, 1));
-            row![
-                container(render_one(left_md, left_slide))
-                    .width(iced::FillPortion(lw))
-                    .padding(iced::padding::top(lp)),
-                container(render_one(right_md, right_slide))
-                    .width(iced::FillPortion(rw))
-                    .padding(iced::padding::top(rp)),
-            ]
-            .spacing(40.0)
-            .into()
-        }
+        // Same layout as on screen, at design scale (1.0 here).
+        Some(columns) => columns.body(
+            render_one,
+            slide.layout.column_portions().unwrap_or((1, 1)),
+            theme,
+            1.0,
+        ),
         None => render_one(content, slide),
     };
     render::slide_surface(

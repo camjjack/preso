@@ -24,8 +24,8 @@ tables (plain styling), and `--to slidev` targets Slidev; see
 
 | Flag | Result |
 |------|--------|
-| `--export-pdf <file>` | One page per slide, fully revealed. |
-| `--export-pptx <file>` | One PowerPoint slide per slide, fully revealed. |
+| `--export-pdf <file>` | One page per slide, fully revealed — but see [click-through code](#click-through-code-on-a-single-page) below. |
+| `--export-pptx <file>` | One PowerPoint slide per slide, same as above. |
 | `… --export-steps` | One page/slide per **reveal step** — each `<!-- pause -->` and each [click-through](writing/code.md#click-through-highlighting) stage becomes its own page. |
 | `--export-pdf <file> --export-2up` | Handout layout: two slides per A4 page (PDF only). |
 
@@ -36,6 +36,20 @@ preso talk.md --export-pdf steps.pdf --export-steps
 # A printable handout
 preso talk.md --export-pdf handout.pdf --export-2up
 ```
+
+### Click-through code on a single page
+
+"Fully revealed" is the right reading of a `<!-- pause -->` build — the page
+shows everything the slide eventually says. It is the wrong reading of a
+[click-through code walk](writing/code.md#click-through-highlighting): the last
+stage of `{2-3|5}` emphasises whatever line the walk finished on, so a page
+meant to stand for the slide would arrive mid-explanation with an arbitrary
+line lit up.
+
+So those blocks export at their **first** stage — where the audience first sees
+them. A walk written `{|2|5}`, whose first stage is empty, exports with no
+highlighting at all. `--export-steps` is unaffected: each stage gets its own
+page, which is the point of it.
 
 The `--theme` flag applies to export too, so you can render the same deck under
 different themes:

@@ -17,6 +17,21 @@ pub const DESIGN_HEIGHT: f32 = 1080.0;
 /// since iced offers no measure-before-layout hook.
 const MONO_ADVANCE: f32 = 0.6;
 
+/// Proportional-text advance width as a fraction of the font size, averaged
+/// over mixed-case prose (Inter runs ~0.55em; all-caps is wider, lowercase
+/// narrower). Sizes table columns, the same measure-free estimate as
+/// [`MONO_ADVANCE`].
+const TEXT_ADVANCE: f32 = 0.55;
+
+/// How much wider bold text runs than regular at the same size — table
+/// headers are bold, and in a narrow column the header is often the widest
+/// cell.
+const BOLD_ADVANCE: f32 = 1.08;
+
+/// Largest share of the content width an `![](icon.png) label` image may take
+/// when it carries no `{width=NN%}`, so its label always has room beside it.
+const UNSIZED_IMAGE_TEXT_SHARE: f32 = 0.5;
+
 /// Bundled fonts, shared by the iced font system (loaded in `main`) and
 /// the SVG rasterizer in [`Media`].
 pub const INTER_REGULAR: &[u8] = include_bytes!("../../../assets/fonts/Inter-Regular.ttf");
@@ -200,11 +215,13 @@ fn heading_band(theme: &preso_style::Theme, level: u8) -> f32 {
     size * HEADING_LINE_HEIGHT + theme.spacing.paragraph_gap
 }
 
-/// Top padding (logical px) for each column of a two-column slide so the
-/// columns' body text aligns. A leading heading defines a "header band";
-/// the band is sized to the taller of the two headings, and the column
-/// with the shorter (or no) heading is pushed down to match. Returns
-/// `(left_pad, right_pad)` — at least one is always 0.
+/// Top padding (logical px) for each column of a two-column slide whose
+/// sides *both* lead with a heading, so their body text aligns. Each
+/// heading defines a "header band"; the band is sized to the taller of the
+/// two, and the column with the shorter heading is pushed down to match.
+/// Returns `(left_pad, right_pad)` — at least one is always 0. (A heading
+/// on only one side is hoisted above both columns instead — see
+/// [`preso_core::model::split_column_header`].)
 ///
 /// Heading height is estimated from theme font metrics (iced gives no
 /// measure-before-layout), so a heading that wraps to two lines aligns
@@ -219,6 +236,44 @@ pub fn column_header_pads(
     let (l, r) = (band(left), band(right));
     let max = l.max(r);
     ((max - l) * scale, (max - r) * scale)
+}
+
+/// Gutter between the two columns of a `TwoColumn` slide, in design units.
+const COLUMN_GAP: f32 = 40.0;
+
+/// Compose a `TwoColumn` slide's body from its already-rendered pieces:
+/// the columns side by side under `header`, the full-width heading band
+/// hoisted out of a column when only one side had one. `pads` aligns the
+/// column bodies when both sides kept their own heading (see
+/// [`column_header_pads`]); `portions` is the slide's `left:right` ratio.
+/// Shared by the live views and the export renderer so a slide lays out
+/// identically on screen and on the page.
+pub fn two_column_body<'a>(
+    header: Option<Element<'a, Message>>,
+    left: Element<'a, Message>,
+    right: Element<'a, Message>,
+    pads: (f32, f32),
+    portions: (u16, u16),
+    theme: &preso_style::Theme,
+    scale: f32,
+) -> Element<'a, Message> {
+    let columns = iced::widget::row![
+        container(left)
+            .width(iced::FillPortion(portions.0))
+            .padding(padding::top(pads.0)),
+        container(right)
+            .width(iced::FillPortion(portions.1))
+            .padding(padding::top(pads.1)),
+    ]
+    .spacing(COLUMN_GAP * scale);
+    match header {
+        // The band fills the slide width, so a long heading wraps against
+        // the whole canvas rather than one column's share of it.
+        Some(header) => column![container(header).width(Fill), columns]
+            .spacing(theme.spacing.paragraph_gap * scale)
+            .into(),
+        None => columns.into(),
+    }
 }
 
 /// Custom iced theme so default widget styling follows the deck theme.
@@ -236,10 +291,21 @@ pub fn iced_theme(theme: &preso_style::Theme) -> iced::Theme {
 
 /// Markdown widget settings derived from the theme at a given scale.
 ///
+/// `text_scale` is the slide's own `<!-- slide: size=NN -->` shrink (1.0
+/// when it has none), applied to every type size and to the paragraph gap
+/// so a crowded slide keeps its proportions as it comes down. It multiplies
+/// the type sizes *only* — the render `scale` also governs the content
+/// width, image sizing and border widths, which must not move: an image at
+/// `{width=70%}` is still 70% of the slide on a slide whose text shrank.
+///
 /// Scaled sizes are rounded to whole pixels: fractional text sizes vary
 /// continuously during resize and bloat the glyph caches.
-pub fn markdown_settings(theme: &preso_style::Theme, scale: f32) -> markdown::Settings {
-    let s = |v: f32| Pixels((v * scale).round().max(1.0));
+pub fn markdown_settings(
+    theme: &preso_style::Theme,
+    scale: f32,
+    text_scale: f32,
+) -> markdown::Settings {
+    let s = |v: f32| Pixels((v * text_scale * scale).round().max(1.0));
     let f = &theme.fonts;
     markdown::Settings {
         text_size: s(f.body_size),
@@ -255,9 +321,11 @@ pub fn markdown_settings(theme: &preso_style::Theme, scale: f32) -> markdown::Se
             font: body_font(theme),
             inline_code_highlight: markdown::Highlight {
                 background: color(theme.colors.code_background).into(),
-                border: border::rounded((4.0 * scale).round()),
+                // The chip around inline code tracks the text it wraps, or a
+                // shrunken slide wears an oversized one.
+                border: border::rounded(s(4.0).0),
             },
-            inline_code_padding: padding::left((4.0 * scale).round()).right((4.0 * scale).round()),
+            inline_code_padding: padding::left(s(4.0).0).right(s(4.0).0),
             inline_code_color: color(theme.colors.accent),
             inline_code_font: code_font(theme),
             code_block_font: code_font(theme),
@@ -291,6 +359,17 @@ pub struct SlideContext<'a> {
     /// canvas workarounds (see `overlay::compensated_frame`). `1.0` in
     /// offscreen contexts (export).
     pub scale_factor: f32,
+    /// The slide's `<!-- slide: size=NN -->` as a factor on the theme's
+    /// type sizes (`1.0` when it has none). See [`resolve_text_scale`].
+    pub text_scale: f32,
+    /// Forces the click-through stage of `{a|b|c}` code blocks, instead of
+    /// following `step`. `Some(0)` for a page that stands for the whole
+    /// slide — the one-page-per-slide PDF/PPTX export — where "fully
+    /// revealed" is the right reading of a `<!-- pause -->` build but the
+    /// wrong one of a walk through code: the last stage emphasises whatever
+    /// the walk finished on, so a handout arrives mid-explanation. `None`
+    /// elsewhere, where the stage follows the reveal step as it should.
+    pub code_stage: Option<usize>,
     /// Highlight-author mode (`H` on the presenter): stack an interactive
     /// drag canvas over every image so dragging a box publishes a
     /// `preso-hl-draw:` URI (see `HighlightAuthor`). Only ever set for the
@@ -300,6 +379,28 @@ pub struct SlideContext<'a> {
 
 /// Resolve a slide's horizontal alignment: a per-slide `halign=` override
 /// wins over the (kind-resolved) theme's `[slide].halign`.
+/// A slide's `<!-- slide: size=NN -->` as a factor on the theme's type
+/// sizes: `1.0` when it has none. Expressed as a ratio rather than an
+/// absolute size so headings, code and paragraph spacing come down with the
+/// body text instead of the slide losing its proportions.
+///
+/// Clamped: a `size` far from the theme's own would render a slide as
+/// unreadable specks or a single overflowing word, and a directive typo
+/// shouldn't be able to do that.
+pub fn resolve_text_scale(
+    overrides: &preso_core::SlideOverrides,
+    theme: &preso_style::Theme,
+) -> f32 {
+    let Some(size) = overrides.size else {
+        return 1.0;
+    };
+    let body = theme.fonts.body_size;
+    if body <= 0.0 {
+        return 1.0;
+    }
+    (size / body).clamp(0.2, 3.0)
+}
+
 pub fn resolve_halign(
     overrides: &preso_core::SlideOverrides,
     theme: &preso_style::Theme,
@@ -352,7 +453,8 @@ impl<'a> PresoViewer<'a> {
             border_c.a = 0.4; // a quiet default rule when unthemed
         }
         let border_w = t.border_width.unwrap_or(1.0) * scale;
-        let pad = scaled_padding(t.padding_sides(10.0), scale);
+        let pad_sides = t.padding_sides(10.0);
+        let pad = scaled_padding(pad_sides, scale);
         let radius = t.border_radius.unwrap_or(0.0) * scale;
         let text_c = color(pal.text);
         let base = body_font(self.ctx.theme);
@@ -368,19 +470,12 @@ impl<'a> PresoViewer<'a> {
             .map(|s| Pixels((s * scale).round().max(1.0)))
             .unwrap_or(settings.text_size);
         let ncols = table.headers.len().max(1);
-
-        // Column widths proportional to the widest line in the column (cheap
-        // stand-in for content measurement, which iced offers no hook for).
-        // `<br>` splits a cell into lines, so measure the longest one.
-        let widths: Vec<u16> = (0..ncols)
-            .map(|c| {
-                let mut w = table.headers.get(c).map_or(1, |h| widest_line(h));
-                for r in &table.rows {
-                    w = w.max(r.get(c).map_or(0, |s| widest_line(s)));
-                }
-                w.clamp(1, 1000) as u16
-            })
-            .collect();
+        // Design units, so the ratio holds at any window scale.
+        let widths = column_widths(
+            table,
+            table.font_size.unwrap_or(self.ctx.theme.fonts.body_size),
+            pad_sides[1] + pad_sides[3],
+        );
 
         let row_el = |cells: &[String], fg: Color, font: Font, bg: Option<Color>| {
             let cols = (0..ncols).map(|c| {
@@ -489,12 +584,19 @@ impl<'a> PresoViewer<'a> {
         // (respecting alpha), so the transparent background is untouched.
         let ops: Vec<crate::media::MaskOp> = shapes.iter().filter_map(|s| s.mask_op()).collect();
         let masked = (!ops.is_empty())
-            .then(|| self.ctx.media.masked_image(base_url, target_width, &ops))
+            .then(|| {
+                self.ctx
+                    .media
+                    .masked_image(base_url, target_width, self.ctx.scale, &ops)
+            })
             .flatten();
         let baked = masked.is_some();
         let (handle, size) = match masked {
             Some(hs) => hs,
-            None => self.ctx.media.slide_image(base_url, target_width)?,
+            None => self
+                .ctx
+                .media
+                .slide_image(base_url, target_width, self.ctx.scale)?,
         };
 
         let is_vector = base_url.to_lowercase().ends_with(".svg");
@@ -671,6 +773,101 @@ impl<'a> PresoViewer<'a> {
             .align_x(iced::alignment::Horizontal::Center)
             .padding(padding::top(settings.spacing.0).bottom(settings.spacing.0))
             .into()
+    }
+
+    /// Render a run of image-with-text lines: each image and the text beside
+    /// it, vertically centred, stacked tight. The image may lead, trail, or
+    /// sit between two pieces of text. The whole run is one block (see
+    /// [`preso_core::ImageTextRun`]) so the lines sit together rather than a
+    /// paragraph gap apart; a run lifted out of a list item is that item's
+    /// content, so it drops the block padding the list already provides.
+    ///
+    /// The labels share a left edge whenever the images carry `{width=NN%}`
+    /// — the image column takes the widest of those. Images sized naturally
+    /// can't be measured before layout, so a run of those starts each label
+    /// right after its own image instead. Text *before* an image rules the
+    /// column out: what starts the row is then the text, of a width we can't
+    /// know until it lays out.
+    fn render_image_text(
+        &self,
+        run: &'a preso_core::ImageTextRun,
+        settings: markdown::Settings,
+    ) -> Element<'a, markdown::Uri> {
+        let gap = settings.spacing.0;
+        let content_w = self.ctx.content_width();
+        let aligned = run.lines.iter().all(|l| l.before.is_empty());
+        let column_w = if aligned {
+            run.lines
+                .iter()
+                .filter_map(|l| parse_image_fragment(&l.image.url).1.width_pct)
+                .fold(0.0, f32::max)
+                * content_w
+                / 100.0
+        } else {
+            0.0
+        };
+
+        let rows = run.lines.iter().map(move |l| {
+            let (base_url, attrs) = parse_image_fragment(&l.image.url);
+            // An unsized image takes its natural width, which for anything
+            // bigger than an icon would swallow the row and push the label
+            // off the slide — so cap that case. An explicit `{width=NN%}` is
+            // the author's call and stands.
+            let max_w = if attrs.width_pct.is_some() {
+                content_w
+            } else {
+                content_w * UNSIZED_IMAGE_TEXT_SHARE
+            };
+            let image = self
+                .build_image(base_url, &attrs, max_w)
+                .unwrap_or_else(|| {
+                    // Missing image: its alt text, muted, like a stacked one.
+                    iced::widget::text(l.image.alt.clone())
+                        .size(settings.text_size)
+                        .color(color(self.ctx.theme.colors.muted))
+                        .into()
+                });
+            let cell: Element<'a, markdown::Uri> = if column_w > 0.0 {
+                container(image).width(column_w).into()
+            } else {
+                image
+            };
+            // Inline markdown in the label, the same set a table cell takes.
+            let label = |text: &str| {
+                rich_text(inline_spans(
+                    &normalize_breaks(text),
+                    body_font(self.ctx.theme),
+                    code_font(self.ctx.theme),
+                    color(self.ctx.theme.colors.text),
+                    mark_highlight(self.ctx.theme, self.ctx.scale),
+                ))
+                .on_link_click(|u| u)
+                .size(settings.text_size)
+            };
+            // Text either side of the image, in the order it was written.
+            let mut parts: Vec<Element<'a, markdown::Uri>> = Vec::with_capacity(3);
+            if !l.before.is_empty() {
+                parts.push(label(&l.before).into());
+            }
+            parts.push(cell);
+            if !l.after.is_empty() {
+                parts.push(label(&l.after).into());
+            }
+            Element::from(
+                iced::widget::Row::with_children(parts)
+                    .spacing(gap)
+                    .align_y(iced::Alignment::Center),
+            )
+        });
+
+        let block = container(column(rows).width(Fill)).width(Fill);
+        // Inside a list item the list already spaces the rows; padding here
+        // would push the bullet away from its own text.
+        if run.in_list {
+            block.into()
+        } else {
+            block.padding(padding::top(gap).bottom(gap)).into()
+        }
     }
 }
 
@@ -850,6 +1047,36 @@ fn widest_line(s: &str) -> usize {
         .unwrap_or(0)
 }
 
+/// Relative widths for a table's columns, handed to iced as `FillPortion`s.
+/// Each is an estimate of the column's rendered width in design units: its
+/// widest line at an average character advance ([`TEXT_ADVANCE`], with the
+/// bold header counted wider), *plus* `pad_x`, the cell's horizontal padding.
+///
+/// The padding is a fixed cost per column, not a share of one. Folding it
+/// into the ratio — as sizing purely by character count did — starves a
+/// narrow column: a `TYPE` header beside a column of sentences ends up with
+/// a box barely wider than the word itself, so its text sits hard against
+/// its neighbour's with no visible gutter.
+///
+/// A cheap stand-in for content measurement, which iced offers no hook for.
+/// Design units throughout, so the ratio doesn't drift with window scale.
+fn column_widths(table: &preso_core::Table, font_size: f32, pad_x: f32) -> Vec<u16> {
+    (0..table.headers.len().max(1))
+        .map(|c| {
+            // `<br>` splits a cell into lines, so measure the longest one.
+            let mut chars = table
+                .headers
+                .get(c)
+                .map_or(0.0, |h| widest_line(h) as f32 * BOLD_ADVANCE);
+            for row in &table.rows {
+                chars = chars.max(row.get(c).map_or(0.0, |s| widest_line(s) as f32));
+            }
+            let width = chars * font_size * TEXT_ADVANCE + pad_x;
+            width.round().clamp(1.0, 10_000.0) as u16
+        })
+        .collect()
+}
+
 impl<'a> markdown::Viewer<'a, markdown::Uri> for PresoViewer<'a> {
     fn on_link_click(uri: markdown::Uri) -> markdown::Uri {
         uri
@@ -979,6 +1206,17 @@ impl<'a> markdown::Viewer<'a, markdown::Uri> for PresoViewer<'a> {
             return self.render_table(table, settings);
         }
 
+        // Image-plus-label markers produced by preso-core: images with the
+        // text that followed them on the same line, beside them.
+        if let Some(index) = url.strip_prefix("preso-imagetext:")
+            && let Some(run) = index
+                .parse::<usize>()
+                .ok()
+                .and_then(|i| self.ctx.math_slide.image_texts.get(i))
+        {
+            return self.render_image_text(run, settings);
+        }
+
         // Image-row markers produced by preso-core: a run of adjacent images
         // laid out side by side instead of stacked.
         if let Some(index) = url.strip_prefix("preso-imagerow:")
@@ -1070,7 +1308,7 @@ impl<'a> markdown::Viewer<'a, markdown::Uri> for PresoViewer<'a> {
         // single stage, so this is just its line set at every step.
         let code_block = self.ctx.code_slide.code_blocks.get(ordinal);
         let highlighted = code_block.and_then(|cb| {
-            let stage = self.ctx.step.min(cb.stage_count().saturating_sub(1));
+            let stage = code_stage(cb.stage_count(), self.ctx.step, self.ctx.code_stage);
             cb.highlighted_lines_at(stage)
         });
         let highlight_bg = match self.ctx.theme.code_block.highlight_color {
@@ -1289,7 +1527,7 @@ fn slide_view<'a>(
     ctx: SlideContext<'a>,
 ) -> Element<'a, markdown::Uri> {
     use preso_style::HorizontalAlign as H;
-    let settings = markdown_settings(ctx.theme, ctx.scale);
+    let settings = markdown_settings(ctx.theme, ctx.scale, ctx.text_scale);
     let halign = ctx.halign;
     let viewer = PresoViewer {
         ctx,
@@ -1852,12 +2090,25 @@ pub fn slide_surface<'a>(
 
     // Effective accent bars: the single `bar` plus any extra `bars`, minus
     // hidden ones. Drives both content reservation and drawing.
-    let bars: Vec<&preso_style::AccentBar> = style
-        .bar
-        .iter()
-        .chain(style.bars.iter())
-        .filter(|b| !b.hidden)
-        .collect();
+    //
+    // A slide that names its own background image has none of them. The bars
+    // are the theme dressing its background, and that slide has replaced the
+    // background outright — banding a photo with the theme's accent colour
+    // reads as a rendering fault, not a design. Dropping them also frees the
+    // space they reserve, so the image gets the whole canvas and the content
+    // sits on it rather than around where a bar used to be. A background
+    // image set by the *theme* keeps its bars: that pairing is the theme
+    // author's own.
+    let bars: Vec<&preso_style::AccentBar> = if background_image_override(overrides).is_some() {
+        Vec::new()
+    } else {
+        style
+            .bar
+            .iter()
+            .chain(style.bars.iter())
+            .filter(|b| !b.hidden)
+            .collect()
+    };
 
     // 1. Background (content renders on top, so a background image doubles
     //    as a "text over photo" slide).
@@ -1949,7 +2200,7 @@ pub fn slide_surface<'a>(
     if let Some(text_str) = footnote.filter(|s| !s.trim().is_empty())
         && !theme.footnote.hidden
     {
-        layers.push(footnote_layer(theme, text_str, scale));
+        layers.push(footnote_layer(theme, text_str, scale, reserved));
     }
 
     container(stack(layers)).width(width).height(height).into()
@@ -1978,30 +2229,41 @@ fn background_layer<'a>(
             })
             .into()
     };
-    let cover = |handle: iced::widget::image::Handle| -> Element<'a, Message> {
+    let fitted = |handle: iced::widget::image::Handle, fit| -> Element<'a, Message> {
         iced::widget::image(handle)
             .width(Fill)
             .height(Fill)
-            .content_fit(iced::ContentFit::Cover)
+            .content_fit(fit)
             .into()
     };
 
     let override_str = overrides.background.as_deref();
     let override_color = override_str.and_then(preso_style::Color::parse);
-    // A non-color override value is treated as an image path (deck-relative).
-    let override_image = match (override_str, override_color) {
-        (Some(s), None) if !s.is_empty() => Some(s),
-        _ => None,
-    };
-    let bg_image = override_image.or(style.background_image.as_deref());
+    let bg_image = background_image_override(overrides).or(style.background_image.as_deref());
 
     if let Some(c) = override_color {
         solid(color(c).into())
     } else if let Some(path) = bg_image {
-        // Cover-fit over the whole canvas; fall back to the flat theme
-        // color if the file can't load (missing/unsupported).
-        match media.slide_image(path, Some(size.width)) {
-            Some((handle, _)) => cover(handle),
+        // Fall back to the flat theme color if the file can't load
+        // (missing/unsupported).
+        match media.slide_image(path, Some(size.width), 1.0) {
+            Some((handle, _)) => match background_fit(overrides) {
+                // `cover` fills the slide and crops the overhang — the
+                // default, and right for a photo with room to spare.
+                iced::ContentFit::Cover => fitted(handle, iced::ContentFit::Cover),
+                // Anything else can leave the canvas uncovered (`contain`
+                // on a square image leaves bars down the sides), so the
+                // picture goes over a filled backdrop rather than over
+                // whatever the renderer leaves behind.
+                fit => {
+                    let backdrop = overrides
+                        .background_fill
+                        .as_deref()
+                        .and_then(preso_style::Color::parse)
+                        .unwrap_or(theme.colors.background);
+                    iced::widget::stack![solid(color(backdrop).into()), fitted(handle, fit)].into()
+                }
+            },
             None => solid(color(theme.colors.background).into()),
         }
     } else if let Some(g) = style.gradient {
@@ -2040,7 +2302,9 @@ fn layer_image_element<'a>(
     scale: f32,
 ) -> Option<Element<'a, Message>> {
     let target = li.width.map(|w| canvas_width * w / 100.0);
-    let (handle, size) = media.slide_image(&li.path, target)?;
+    // Intrinsic units (scale 1.0): the width below applies `scale` itself,
+    // so asking for a scaled size here would apply it twice.
+    let (handle, size) = media.slide_image(&li.path, target, 1.0)?;
     let w = target
         .unwrap_or(size.width * scale)
         .min(canvas_width)
@@ -2144,7 +2408,8 @@ fn logo_layer<'a>(
     use iced::widget::image;
 
     let target = canvas_width * logo.width / 100.0;
-    let (handle, size) = media.slide_image(&logo.path, Some(target))?;
+    // Always sized, so the fallback scale never applies.
+    let (handle, size) = media.slide_image(&logo.path, Some(target), 1.0)?;
     let radius = logo.border.map(|b| b.radius * scale).unwrap_or(0.0);
     // Always honor the requested width; derive height from the
     // image's aspect ratio when known.
@@ -2210,10 +2475,19 @@ fn number_layer<'a>(
 }
 
 /// Layer 7: the footnote — a small disclaimer line along the bottom edge.
+///
+/// `reserved` is the space carved out by `reserve` accent bars, which the
+/// footnote keeps clear of like the slide's other text. It is authored in
+/// the deck (`<!-- footnote: … -->`) and meant to be read, not chrome the
+/// theme places: a credit line drawn in muted grey over a coloured bottom
+/// bar is illegible, and the bar is exactly where a footnote wants to sit.
+/// A bar that *doesn't* reserve has said overlapping is fine, and is
+/// overlapped as before.
 fn footnote_layer<'a>(
     theme: &preso_style::Theme,
     text_str: String,
     scale: f32,
+    reserved: iced::Padding,
 ) -> Element<'a, Message> {
     use iced::alignment::{Horizontal, Vertical};
     use iced::widget::text;
@@ -2237,18 +2511,69 @@ fn footnote_layer<'a>(
     };
     // The line fills the width (so alignment has room and long credits
     // wrap), inset from the sides and bottom, anchored to the bottom edge.
-    let px = style.padding_x * scale;
-    let line = container(label).width(Fill).align_x(halign).padding(
-        iced::Padding::default()
-            .left(px)
-            .right(px)
-            .bottom(style.padding_y * scale),
-    );
+    let line = container(label)
+        .width(Fill)
+        .align_x(halign)
+        .padding(footnote_padding(style, scale, reserved));
     container(line)
         .width(Fill)
         .height(Fill)
         .align_y(Vertical::Bottom)
         .into()
+}
+
+/// How a slide's `background=` image is scaled onto the canvas, from its
+/// `fit=` (default `cover`).
+///
+/// `cover` fills the slide and crops the overhang, which is what a landscape
+/// photo wants and what a square one suffers: on a 16:9 slide it loses the
+/// top and bottom. `contain` scales the whole picture in, leaving the
+/// backdrop showing where it doesn't reach — see the `fill=` colour.
+fn background_fit(overrides: &preso_core::SlideOverrides) -> iced::ContentFit {
+    match overrides.background_fit.as_deref() {
+        Some("contain") | Some("fit") => iced::ContentFit::Contain,
+        // Stretches to the slide, distorting the image; occasionally what a
+        // texture or gradient image wants.
+        Some("stretch") | Some("fill") => iced::ContentFit::Fill,
+        // Its own pixels, centred, neither grown nor shrunk.
+        Some("none") => iced::ContentFit::None,
+        _ => iced::ContentFit::Cover,
+    }
+}
+
+/// The slide's `<!-- slide: background=… -->` read as an image path: any
+/// non-empty value that doesn't parse as a colour is one (deck-relative).
+///
+/// Shared by the background layer and the accent bars, so the two can't
+/// disagree about what counts as a full-bleed image slide.
+fn background_image_override(overrides: &preso_core::SlideOverrides) -> Option<&str> {
+    let value = overrides.background.as_deref()?;
+    match (value.is_empty(), preso_style::Color::parse(value)) {
+        (false, None) => Some(value),
+        _ => None,
+    }
+}
+
+/// Which click-through stage a code block shows: the reveal step, clamped to
+/// the block's last stage, unless [`SlideContext::code_stage`] forces one
+/// (the one-page-per-slide export forces the first).
+fn code_stage(stage_count: usize, step: usize, forced: Option<usize>) -> usize {
+    forced.unwrap_or(step).min(stage_count.saturating_sub(1))
+}
+
+/// Inset for the footnote line: its own `[footnote]` padding, plus whatever
+/// `reserve` bars have carved out, so the credit clears a reserved bar
+/// rather than being drawn across it.
+fn footnote_padding(
+    style: &preso_style::Footnote,
+    scale: f32,
+    reserved: iced::Padding,
+) -> iced::Padding {
+    let px = style.padding_x * scale;
+    iced::Padding::default()
+        .left(reserved.left + px)
+        .right(reserved.right + px)
+        .bottom(reserved.bottom + style.padding_y * scale)
 }
 
 /// A full-canvas container whose child is anchored to `corner`. Shared by
@@ -2291,6 +2616,123 @@ pub fn slide_inert<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn background_fit_defaults_to_cover() {
+        let fit = |v: Option<&str>| {
+            background_fit(&preso_core::SlideOverrides {
+                background_fit: v.map(str::to_string),
+                ..Default::default()
+            })
+        };
+        // The default, and what every deck written before `fit=` existed gets.
+        assert_eq!(fit(None), iced::ContentFit::Cover);
+        assert_eq!(fit(Some("cover")), iced::ContentFit::Cover);
+        // A typo falls back to it rather than rendering something startling.
+        assert_eq!(fit(Some("covfefe")), iced::ContentFit::Cover);
+
+        // The one this exists for: the whole picture, uncropped.
+        assert_eq!(fit(Some("contain")), iced::ContentFit::Contain);
+        assert_eq!(fit(Some("fit")), iced::ContentFit::Contain);
+
+        assert_eq!(fit(Some("stretch")), iced::ContentFit::Fill);
+        assert_eq!(fit(Some("none")), iced::ContentFit::None);
+    }
+
+    #[test]
+    fn only_an_image_background_override_counts_as_full_bleed() {
+        let bg = |v: Option<&str>| preso_core::SlideOverrides {
+            background: v.map(str::to_string),
+            ..Default::default()
+        };
+        let is_image = |v: Option<&str>| background_image_override(&bg(v)).is_some();
+
+        // A path — the slide has replaced the background outright, so the
+        // theme's bars come off it.
+        assert!(is_image(Some("photos/skyline.jpg")));
+        assert!(is_image(Some("reverse-engineering-ii.assets/image138.png")));
+
+        // A colour is still the theme dressing a flat background, so its
+        // bars stay; likewise no override at all, or an empty one.
+        assert!(!is_image(Some("#334455")));
+        assert!(!is_image(Some("#fff")));
+        assert!(!is_image(Some("")));
+        assert!(!is_image(None));
+    }
+
+    #[test]
+    fn a_forced_code_stage_overrides_the_reveal_step() {
+        // Presenting: the walk follows the step, clamping at the last stage
+        // so a slide with more reveal steps than stages holds the end.
+        assert_eq!(code_stage(3, 0, None), 0);
+        assert_eq!(code_stage(3, 1, None), 1);
+        assert_eq!(code_stage(3, 9, None), 2);
+        // A static `{2,4-6}` is one stage, at every step.
+        assert_eq!(code_stage(1, 7, None), 0);
+
+        // One page standing for the whole slide forces the first stage,
+        // however far the slide's reveals have run — otherwise the page
+        // lands on whatever line the walk finished on.
+        assert_eq!(code_stage(3, 9, Some(0)), 0);
+        assert_eq!(code_stage(1, 4, Some(0)), 0);
+        // Still clamped: a forced stage past the end can't index off it.
+        assert_eq!(code_stage(2, 0, Some(5)), 1);
+    }
+
+    #[test]
+    fn a_footnote_clears_a_reserved_bar() {
+        let style = preso_style::Footnote {
+            padding_x: 10.0,
+            padding_y: 4.0,
+            ..preso_style::Theme::default().footnote
+        };
+        let none = iced::Padding::from(0.0);
+
+        // No bars: the footnote's own padding, scaled, and nothing else.
+        let plain = footnote_padding(&style, 2.0, none);
+        assert_eq!((plain.left, plain.right, plain.bottom), (20.0, 20.0, 8.0));
+
+        // A reserving bottom bar pushes the credit above it, instead of the
+        // line being drawn across the bar in muted text.
+        let bar = iced::Padding::default().bottom(60.0);
+        let cleared = footnote_padding(&style, 2.0, bar);
+        assert_eq!(cleared.bottom, 68.0);
+        assert_eq!(cleared.left, 20.0, "a bottom bar must not inset the sides");
+
+        // Side bars inset the line so a long credit wraps clear of them.
+        let sides = iced::Padding::default().left(30.0).right(15.0);
+        let inset = footnote_padding(&style, 1.0, sides);
+        assert_eq!((inset.left, inset.right), (40.0, 25.0));
+    }
+
+    #[test]
+    fn slide_size_scales_every_type_size_together() {
+        let theme = preso_style::Theme::default();
+        let body = theme.fonts.body_size;
+        let overrides = |size: Option<f32>| preso_core::SlideOverrides {
+            size,
+            ..Default::default()
+        };
+
+        // No directive: the theme's own sizes, untouched.
+        assert_eq!(resolve_text_scale(&overrides(None), &theme), 1.0);
+
+        // `size=NN` is an absolute body size, expressed as a ratio so the
+        // headings and code come down with it.
+        let half = resolve_text_scale(&overrides(Some(body / 2.0)), &theme);
+        assert!((half - 0.5).abs() < f32::EPSILON, "{half}");
+        let plain = markdown_settings(&theme, 1.0, 1.0);
+        let small = markdown_settings(&theme, 1.0, half);
+        assert_eq!(small.text_size.0, (plain.text_size.0 * 0.5).round());
+        assert_eq!(small.h2_size.0, (plain.h2_size.0 * 0.5).round());
+        assert_eq!(small.code_size.0, (plain.code_size.0 * 0.5).round());
+        // The paragraph gap comes down too, or a shrunken slide is all gaps.
+        assert_eq!(small.spacing.0, (plain.spacing.0 * 0.5).round());
+
+        // A typo'd size can't render the slide as specks or one giant word.
+        assert_eq!(resolve_text_scale(&overrides(Some(0.001)), &theme), 0.2);
+        assert_eq!(resolve_text_scale(&overrides(Some(9999.0)), &theme), 3.0);
+    }
 
     #[test]
     fn author_drag_normalizes_and_formats() {
@@ -2353,6 +2795,53 @@ mod tests {
         assert_eq!(normalize_breaks("a < b > c"), "a < b > c"); // not a <br> tag
         // Width heuristic measures the longest line, not the whole string.
         assert_eq!(widest_line("short<br>much longer line"), 16);
+    }
+
+    /// A short-header column beside a column of sentences must still get a
+    /// box wide enough for its own (bold) header *and* both paddings —
+    /// sizing columns by bare character count left the header sitting hard
+    /// against the next column's text.
+    #[test]
+    fn narrow_table_column_keeps_its_gutter() {
+        let cell = |s: &str| s.to_string();
+        let table = preso_core::Table {
+            headers: vec![cell("TYPE"), cell("DESCRIPTION")],
+            aligns: vec![preso_core::TableAlign::Left; 2],
+            rows: vec![
+                vec![cell("SYN"), cell("Synchronise sequence numbers")],
+                vec![cell("ACK"), cell("Acknowledge number is set")],
+                vec![cell("FIN"), cell("Last packet")],
+            ],
+            font_size: None,
+        };
+        const SIZE: f32 = 36.0; // theme default body size, design units
+        const PAD_X: f32 = 20.0; // 10 either side, the `[table]` default
+        // The right column of a two-column 1920 slide.
+        const AVAILABLE: f32 = 880.0;
+        // Inter Bold capitals measured off a render: well above the
+        // mixed-case average [`TEXT_ADVANCE`] assumes, which is the point —
+        // the layout has to hold up when a heading runs wider than the
+        // estimate, and short all-caps headers are exactly where it does.
+        const CAPS_BOLD_ADVANCE: f32 = 0.66;
+
+        let widths = column_widths(&table, SIZE, PAD_X);
+        let total: f32 = widths.iter().copied().map(f32::from).sum();
+        let box_width = |c: usize| AVAILABLE * f32::from(widths[c]) / total;
+        let header_px =
+            |c: usize| table.headers[c].chars().count() as f32 * SIZE * CAPS_BOLD_ADVANCE;
+
+        for c in 0..table.headers.len() {
+            let gutter = box_width(c) - header_px(c);
+            assert!(
+                gutter >= PAD_X,
+                "column {c} ({}) leaves {gutter:.1} for {PAD_X} of padding, so its \
+                 header sits against the next column",
+                table.headers[c],
+            );
+        }
+        // The wide column still takes the lion's share — padding nudges the
+        // ratio, it doesn't equalise it.
+        assert!(box_width(1) > 3.0 * box_width(0));
     }
 
     #[test]

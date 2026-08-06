@@ -320,10 +320,16 @@ fn parse_slide(
             .and_then(|v| v.parse().ok())
             .unwrap_or(order as u32);
 
+        // A title becomes `## …`; everything else here opens a block of its
+        // own (a bare subtitle line, or a bullet's content).
+        let spot = match ph_type {
+            Some("ctrTitle") | Some("title") => Spot::Heading,
+            _ => Spot::BlockStart,
+        };
         let paras: Vec<(usize, String)> = sp
             .descendants()
             .filter(|n| local(n) == "p")
-            .map(|p| (para_level(p), para_text(p)))
+            .map(|p| (para_level(p), para_text(p, spot)))
             .filter(|(_, t)| !t.trim().is_empty())
             .collect();
         if paras.is_empty() {
@@ -380,10 +386,19 @@ fn parse_slide(
     let mut unresolved = 0;
     let mut unsupported = 0;
     for pic in doc.descendants().filter(|n| local(n) == "pic") {
-        let embed = pic
-            .descendants()
-            .find(|n| local(n) == "blip")
-            .and_then(|b| b.attribute((REL_NS, "embed")));
+        let blip_embed = |name: &str| {
+            pic.descendants()
+                .find(|n| local(n) == name)
+                .and_then(|b| b.attribute((REL_NS, "embed")))
+        };
+        // PowerPoint stores an SVG picture as a raster fallback in `a:blip`,
+        // with the vector itself hanging off an `asvg:svgBlip` extension.
+        // preso rasterises SVG at display size, so prefer the vector (the
+        // fallback then goes unreferenced and isn't extracted); fall back to
+        // the raster if that relationship doesn't resolve.
+        let embed = blip_embed("svgBlip")
+            .filter(|rid| rels.contains_key(*rid))
+            .or_else(|| blip_embed("blip"));
         let alt = pic
             .descendants()
             .find(|n| local(n) == "cNvPr")
@@ -393,8 +408,8 @@ fn parse_slide(
         match embed.and_then(|rid| rels.get(rid)) {
             Some(rel) => {
                 let src = resolve("ppt/slides", &rel.target);
-                // Skip vector/unsupported formats (EMF/WMF/SVG): preso renders
-                // raster images only, and an undecodable one crashes export.
+                // Skip formats preso can't render (EMF/WMF and exotica); an
+                // undecodable bitmap crashes export.
                 if supported_image(&src) {
                     slide.images.push(Image { src, alt });
                 } else {
@@ -412,7 +427,7 @@ fn parse_slide(
     }
     if unsupported > 0 {
         warnings.push(format!(
-            "slide {num}: {unsupported} vector image(s) (EMF/WMF/SVG) skipped — preso renders raster images only"
+            "slide {num}: {unsupported} vector image(s) (EMF/WMF) skipped — preso renders raster and SVG images"
         ));
     }
     if unresolved > 0 {
@@ -434,7 +449,7 @@ fn parse_table(tbl: roxmltree::Node) -> Vec<Vec<String>> {
             .map(|tc| {
                 tc.descendants()
                     .filter(|n| local(n) == "p")
-                    .map(para_text)
+                    .map(|p| para_text(p, Spot::Inline))
                     .collect::<Vec<_>>()
                     .join(" ")
                     .trim()
@@ -494,10 +509,12 @@ fn extract_notes(xml: &str) -> Option<String> {
         if !is_body {
             continue;
         }
+        // Each note paragraph gets its own line inside the `<!-- note: … -->`
+        // comment, so treat every one as opening a block.
         let text = sp
             .descendants()
             .filter(|n| local(n) == "p")
-            .map(para_text)
+            .map(|p| para_text(p, Spot::BlockStart))
             .filter(|t| !t.trim().is_empty())
             .collect::<Vec<_>>()
             .join("\n");
@@ -524,7 +541,10 @@ fn para_level(p: roxmltree::Node) -> usize {
 /// the whole paragraph shares one format we emit plain text — uniform styling
 /// is the base look, not inline emphasis; emphasis is only meaningful where a
 /// run *contrasts* with its neighbours.
-fn para_text(p: roxmltree::Node) -> String {
+///
+/// `spot` says where the finished text lands, which decides how much of it
+/// needs escaping — see [`Spot`].
+fn para_text(p: roxmltree::Node, spot: Spot) -> String {
     let mut runs: Vec<(bool, bool, String)> = Vec::new();
     for r in p.children().filter(|n| matches!(local(n), "r" | "fld")) {
         let text: String = r
@@ -551,11 +571,30 @@ fn para_text(p: roxmltree::Node) -> String {
         }
     }
 
+    // Whether a bracket in this paragraph could close a link is a property of
+    // the whole paragraph, not of one run: PowerPoint splits text across runs
+    // freely, so the `](` completing a `[…]` may well sit in the next one.
+    let joined: String = runs.iter().map(|(_, _, t)| t.as_str()).collect();
+    let links = joined.contains("](") || joined.contains("][");
+    let last = runs.len().saturating_sub(1);
+    let escape_at = |i: usize, emphasised: bool| Escape {
+        // Emphasis markers go in front of the run's text, so an emphasised
+        // run no longer starts its block.
+        block_start: i == 0 && spot == Spot::BlockStart && !emphasised,
+        heading_end: i == last && spot == Spot::Heading && !emphasised,
+        links,
+    };
+
     if runs.len() <= 1 {
-        runs.iter().map(|(_, _, t)| escape_md(t)).collect()
+        runs.iter()
+            .map(|(_, _, t)| escape_md(t, escape_at(0, false)))
+            .collect()
     } else {
         runs.iter()
-            .map(|(bold, italic, t)| emphasize(t, *bold, *italic))
+            .enumerate()
+            .map(|(i, (bold, italic, t))| {
+                emphasize(t, *bold, *italic, escape_at(i, *bold || *italic))
+            })
             .collect()
     }
 }
@@ -567,12 +606,12 @@ fn is_true(v: &str) -> bool {
 
 /// Wrap escaped `text` in emphasis markers, keeping any leading/trailing
 /// whitespace *outside* the markers (markdown won't emphasise `** x **`).
-fn emphasize(text: &str, bold: bool, italic: bool) -> String {
+fn emphasize(text: &str, bold: bool, italic: bool, esc: Escape) -> String {
     let marker = match (bold, italic) {
         (true, true) => "***",
         (true, false) => "**",
         (false, true) => "*",
-        (false, false) => return escape_md(text),
+        (false, false) => return escape_md(text, esc),
     };
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -580,7 +619,7 @@ fn emphasize(text: &str, bold: bool, italic: bool) -> String {
     }
     let lead = &text[..text.len() - text.trim_start().len()];
     let trail = &text[text.trim_end().len()..];
-    format!("{lead}{marker}{}{marker}{trail}", escape_md(trimmed))
+    format!("{lead}{marker}{}{marker}{trail}", escape_md(trimmed, esc))
 }
 
 fn local<'i>(n: &roxmltree::Node<'_, 'i>) -> &'i str {
@@ -719,13 +758,22 @@ fn oneline(s: &str) -> String {
 
 /// Like [`oneline`], but also escapes markdown punctuation. For raw text not
 /// already escaped — currently image alt text, which comes from an attribute.
+/// Alt text sits inside `![…]`, so its brackets always have to escape however
+/// the rest of the line reads.
 fn inline(s: &str) -> String {
-    escape_md(&oneline(s))
+    escape_md(
+        &oneline(s),
+        Escape {
+            links: true,
+            ..Escape::default()
+        },
+    )
 }
 
-/// Whether preso can render an image of this path's format. Raster formats
-/// only — vector (EMF/WMF/SVG) and exotic formats are skipped, since iced
-/// rasterises raster images and an undecodable one panics PDF export.
+/// Whether preso can render an image of this path's format: the bitmaps iced
+/// decodes, plus SVG (which preso rasterises through resvg). Office's other
+/// vector formats (EMF/WMF) and exotica are skipped — nothing downstream can
+/// decode them, and an undecodable bitmap panics PDF export.
 fn supported_image(path: &str) -> bool {
     let ext = path
         .rsplit('.')
@@ -734,24 +782,130 @@ fn supported_image(path: &str) -> bool {
         .to_ascii_lowercase();
     matches!(
         ext.as_str(),
-        "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp"
+        "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "svg"
     )
 }
 
-/// Backslash-escape markdown punctuation so PowerPoint's literal text (`C#`,
-/// `a_b`, `*`, `|`, …) renders verbatim rather than as formatting.
-fn escape_md(s: &str) -> String {
+/// Where a paragraph's text will be emitted. Most markdown punctuation is
+/// only markup in one particular position — `#` opens a heading at the start
+/// of a line and closes one at the end of a heading, `>` opens a blockquote
+/// at the start — so what has to be escaped depends on where the text lands.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Spot {
+    /// A heading's text, emitted after `## `.
+    Heading,
+    /// Text that opens a block: a subtitle on a bare line, or a bullet after
+    /// its `- ` marker (a list item's content is a block of its own, so a
+    /// leading `#` or `>` still bites there).
+    BlockStart,
+    /// Inline, with markdown already ahead of it on the line — a table cell,
+    /// an image's alt text. Nothing positional can trigger here.
+    Inline,
+}
+
+/// What [`escape_md`] needs to know beyond the text itself: the positional
+/// hazards its [`Spot`] carries, and whether the *paragraph* could form a
+/// link (a per-run view can't see a `](` that landed in the next run).
+#[derive(Clone, Copy, Default)]
+struct Escape {
+    block_start: bool,
+    heading_end: bool,
+    links: bool,
+}
+
+/// Backslash-escape the markdown punctuation in a run of PowerPoint text that
+/// would otherwise be read as formatting — and only that.
+///
+/// Escaping every candidate character is the safe-looking option, and it's
+/// what this did at first, but the output is a deck someone then edits by
+/// hand: `- ldr Xt, \[Rn, \#4\]` and `Fetch -\> Decode` are worse than the
+/// hazard they guard against, because *neither* was ever going to be markup.
+/// So each character is judged where it actually stands:
+///
+/// - `_` between two alphanumerics can't open or close emphasis under
+///   CommonMark's flanking rules — that's what keeps `snake_case` upright —
+///   so `x86_64` passes through. At a word boundary it still escapes, and
+///   that includes `__init__`, which really is strong emphasis.
+/// - `[` and `]` are only link syntax if some `]` in the paragraph is
+///   followed by `(` or `[`. Failing that, `[Rn, #4]` is plain text.
+/// - `#` opens a heading only as the first thing on a line (and only when
+///   followed by a space), and closes one only as a trailing run inside a
+///   heading. `C#` and `#4` are text.
+/// - `>` quotes only as the first thing on a line, so `Fetch -> Decode` is
+///   text.
+///
+/// The rest (`\`, `` ` ``, `*`, `<`, `|`, `~`) escape unconditionally: each
+/// can bite mid-text, and unlike `_` they carry no flanking rule to lean on.
+fn escape_md(s: &str, esc: Escape) -> String {
+    // The one `#` that would open a heading, and the one that would start a
+    // heading's closing run. Escaping the first of a run is enough to break
+    // it: `\##` is no longer "all hashes", so it reads as text.
+    let opens_heading = esc.block_start.then(|| atx_open(s)).flatten();
+    let closes_heading = esc.heading_end.then(|| atx_close(s)).flatten();
+    let opens_quote = esc.block_start.then(|| block_marker(s, '>')).flatten();
+
     let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        if matches!(
-            c,
-            '\\' | '`' | '*' | '_' | '[' | ']' | '<' | '>' | '|' | '#' | '~'
-        ) {
+    let mut rest = s.char_indices();
+    let mut prev: Option<char> = None;
+    while let Some((i, c)) = rest.next() {
+        let next = rest.clone().next().map(|(_, c)| c);
+        let needs_escape = match c {
+            '_' => {
+                !(prev.is_some_and(char::is_alphanumeric)
+                    && next.is_some_and(char::is_alphanumeric))
+            }
+            '[' | ']' => esc.links,
+            '#' => Some(i) == opens_heading || Some(i) == closes_heading,
+            '>' => Some(i) == opens_quote,
+            '\\' | '`' | '*' | '<' | '|' | '~' => true,
+            _ => false,
+        };
+        if needs_escape {
             out.push('\\');
         }
         out.push(c);
+        prev = Some(c);
     }
     out
+}
+
+/// Byte index of the `#` opening an ATX heading — one to six of them, indented
+/// at most three spaces, then a space or the end of the line. `#4 things`
+/// isn't a heading, and neither is a seventh hash.
+fn atx_open(s: &str) -> Option<usize> {
+    let indent = block_marker(s, '#')?;
+    let rest = &s[indent..];
+    let hashes = rest.len() - rest.trim_start_matches('#').len();
+    if !(1..=6).contains(&hashes) {
+        return None;
+    }
+    match rest[hashes..].chars().next() {
+        None | Some(' ') | Some('\t') => Some(indent),
+        _ => None,
+    }
+}
+
+/// Byte index of the `#` starting the run that would close an ATX heading: a
+/// trailing run of hashes with whitespace (or nothing) before it. In `Uses C#`
+/// the hash follows a letter, so it closes nothing.
+fn atx_close(s: &str) -> Option<usize> {
+    let trimmed = s.trim_end();
+    let start = trimmed.trim_end_matches('#').len();
+    if start == trimmed.len() {
+        return None;
+    }
+    match trimmed[..start].chars().next_back() {
+        None => Some(start),
+        Some(c) if c.is_whitespace() => Some(start),
+        _ => None,
+    }
+}
+
+/// Byte index of `marker` when it leads the line (up to three spaces of
+/// indent, as CommonMark allows before a block marker).
+fn block_marker(s: &str, marker: char) -> Option<usize> {
+    let indent = s.len() - s.trim_start_matches(' ').len();
+    (indent <= 3 && s[indent..].starts_with(marker)).then_some(indent)
 }
 
 #[cfg(test)]
@@ -911,6 +1065,67 @@ mod tests {
     }
 
     #[test]
+    fn svg_images_are_kept() {
+        let xml = r#"<p:sld xmlns:p="p" xmlns:a="a"
+              xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+          <p:cSld><p:spTree>
+            <p:pic><p:nvPicPr><p:cNvPr descr="A logo"/></p:nvPicPr>
+              <p:blipFill><a:blip r:embed="rId1"/></p:blipFill></p:pic>
+          </p:spTree></p:cSld></p:sld>"#;
+        let mut rels = HashMap::new();
+        rels.insert(
+            "rId1".to_string(),
+            Rel {
+                rtype: "http://example/image".into(),
+                target: "../media/image1.svg".into(),
+            },
+        );
+        let mut w = Vec::new();
+        let s = parse_slide(xml, &rels, None, 1, true, &mut w);
+        assert_eq!(s.images[0].src, "ppt/media/image1.svg");
+        assert!(!w.iter().any(|m| m.contains("vector image")));
+    }
+
+    #[test]
+    fn svg_blip_extension_wins_over_the_raster_fallback() {
+        // How PowerPoint itself writes an inserted SVG: the raster fallback in
+        // `a:blip`, the vector in an `asvg:svgBlip` extension under it.
+        let xml = r#"<p:sld xmlns:p="p" xmlns:a="a" xmlns:asvg="asvg"
+              xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+          <p:cSld><p:spTree>
+            <p:pic><p:nvPicPr><p:cNvPr descr="A logo"/></p:nvPicPr>
+              <p:blipFill><a:blip r:embed="rId1"><a:extLst>
+                <a:ext uri="{96DAC541-7B7A-43D3-8B79-37D633B846F1}">
+                  <asvg:svgBlip r:embed="rId2"/>
+                </a:ext></a:extLst></a:blip></p:blipFill></p:pic>
+          </p:spTree></p:cSld></p:sld>"#;
+        let mut rels = HashMap::new();
+        rels.insert(
+            "rId1".to_string(),
+            Rel {
+                rtype: "http://example/image".into(),
+                target: "../media/image1.png".into(),
+            },
+        );
+        rels.insert(
+            "rId2".to_string(),
+            Rel {
+                rtype: "http://example/image".into(),
+                target: "../media/image1.svg".into(),
+            },
+        );
+        let mut w = Vec::new();
+        let s = parse_slide(xml, &rels, None, 1, true, &mut w);
+        assert_eq!(s.images.len(), 1);
+        assert_eq!(s.images[0].src, "ppt/media/image1.svg");
+
+        // An unresolvable extension falls back to the raster blip.
+        rels.remove("rId2");
+        let s = parse_slide(xml, &rels, None, 1, true, &mut Vec::new());
+        assert_eq!(s.images[0].src, "ppt/media/image1.png");
+    }
+
+    #[test]
     fn multiline_alt_text_is_collapsed_to_one_line() {
         // PowerPoint's auto-generated alt text often spans lines; a multi-line
         // `![…]()` would not parse as an image.
@@ -1041,6 +1256,137 @@ mod tests {
         let mut w = Vec::new();
         let s = parse_slide(xml, &HashMap::new(), None, 1, false, &mut w);
         assert_eq!(s.body, vec![(0, "All bold here".into())]);
+    }
+
+    /// `escape_md` for a bullet (the commonest spot), with no link in sight.
+    fn esc_bullet(s: &str) -> String {
+        escape_md(
+            s,
+            Escape {
+                block_start: true,
+                ..Escape::default()
+            },
+        )
+    }
+
+    #[test]
+    fn punctuation_that_cannot_be_markup_is_left_alone() {
+        // The technical-deck staples. None of this is markup where it stands,
+        // and escaping it made the converted file worse to read and edit.
+        assert_eq!(esc_bullet("ldr Xt, [Rn, #4]"), "ldr Xt, [Rn, #4]");
+        assert_eq!(
+            esc_bullet("Fetch -> Decode -> Execute -> Mem -> Wb"),
+            "Fetch -> Decode -> Execute -> Mem -> Wb"
+        );
+        assert_eq!(esc_bullet("written in C# and F#"), "written in C# and F#");
+        assert_eq!(
+            esc_bullet("x86_64 with snake_case_fn"),
+            "x86_64 with snake_case_fn"
+        );
+        // `#4` can't open a heading either — that needs a space after the run.
+        assert_eq!(esc_bullet("#4 in the list"), "#4 in the list");
+    }
+
+    #[test]
+    fn punctuation_in_a_position_that_bites_still_escapes() {
+        // Same characters, now where they really would become markup.
+        assert_eq!(esc_bullet("# heading?"), "\\# heading?");
+        assert_eq!(esc_bullet("> quoted?"), "\\> quoted?");
+        assert_eq!(esc_bullet("  > indented quote"), "  \\> indented quote");
+        // A boundary underscore emphasises; `__init__` is strong emphasis.
+        assert_eq!(esc_bullet("_word_"), "\\_word\\_");
+        assert_eq!(
+            esc_bullet("dunder __init__ method"),
+            "dunder \\_\\_init\\_\\_ method"
+        );
+        // `*` has no flanking rule to lean on — it emphasises intraword too.
+        assert_eq!(esc_bullet("a*b*c"), "a\\*b\\*c");
+        // Brackets escape once the paragraph could actually form a link.
+        let linky = Escape {
+            links: true,
+            ..Escape::default()
+        };
+        // Breaking the brackets is enough — the parens are then plain text.
+        assert_eq!(escape_md("see [docs](url)", linky), "see \\[docs\\](url)");
+    }
+
+    #[test]
+    fn a_heading_escapes_only_its_closing_hashes() {
+        let heading = |s: &str| {
+            escape_md(
+                s,
+                Escape {
+                    heading_end: true,
+                    ..Escape::default()
+                },
+            )
+        };
+        // A trailing hash run after whitespace is ATX's closing sequence, so
+        // `## Sharp #` would lose it.
+        assert_eq!(heading("Sharp #"), "Sharp \\#");
+        assert_eq!(heading("Sharp ##"), "Sharp \\##");
+        // Attached to a word it closes nothing — the reported case.
+        assert_eq!(heading("Written in C#"), "Written in C#");
+        // A heading isn't a line start, so a leading hash is safe there.
+        assert_eq!(heading("#4 Function Example"), "#4 Function Example");
+    }
+
+    /// Every escaper decision above, checked against the parser preso
+    /// actually renders with (iced's markdown widget is pulldown-cmark with
+    /// these options) rather than against my reading of CommonMark: assemble
+    /// the line as the converter would emit it, parse it, and require the
+    /// text to come back exactly as PowerPoint had it.
+    #[test]
+    fn escaped_text_round_trips_through_the_renderer() {
+        use pulldown_cmark::{Event, Options, Parser};
+
+        let literal = [
+            "ldr Xt, [Rn, #4]",
+            "str x0, [sp, #-16]!",
+            "Fetch -> Decode -> Execute -> Mem -> Wb",
+            "written in C# and F#",
+            "x86_64 with snake_case_fn",
+            "dunder __init__ method",
+            "_word_ and a*b*c and `tick` and ~tilde~",
+            "# heading?",
+            "> quoted?",
+            "see [docs](url) here",
+            "100% of a|b <tag> \\slash",
+            "#4 in the list",
+            "Sharp #",
+        ];
+
+        let options = Options::ENABLE_TABLES
+            | Options::ENABLE_STRIKETHROUGH
+            | Options::ENABLE_TASKLISTS
+            | Options::ENABLE_YAML_STYLE_METADATA_BLOCKS;
+        // (prefix, spot) for each place the converter puts escaped text.
+        let spots = [
+            ("- ", Spot::BlockStart),
+            ("", Spot::BlockStart),
+            ("## ", Spot::Heading),
+        ];
+
+        for text in literal {
+            for (prefix, spot) in spots {
+                let esc = Escape {
+                    block_start: spot == Spot::BlockStart,
+                    heading_end: spot == Spot::Heading,
+                    links: text.contains("](") || text.contains("]["),
+                };
+                let line = format!("{prefix}{}", escape_md(text, esc));
+                let rendered: String = Parser::new_ext(&line, options)
+                    .filter_map(|e| match e {
+                        Event::Text(t) | Event::Code(t) => Some(t.to_string()),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(
+                    rendered, text,
+                    "{spot:?} {line:?} did not render back to {text:?}"
+                );
+            }
+        }
     }
 
     #[test]

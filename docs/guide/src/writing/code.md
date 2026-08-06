@@ -107,3 +107,13 @@ all its content; the flag sets it per block):
 print("centered in the page")
 ```
 ````
+
+The language is optional — an unlabelled fence takes the same `{…}` flags, which
+is handy for plain text pinned to one side (a label pointing at a background
+image, say):
+
+````markdown
+``` {align=right}
+<- Packet List
+```
+````

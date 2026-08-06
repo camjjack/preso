@@ -31,6 +31,14 @@ embed, and math/Mermaid/Graphviz render to embedded PNGs. Slides are plain
 (themes don't translate), and PowerPoint has no flow layout, so block
 positions are estimated — expect to nudge things after a handoff.
 
+An **image with text beside it** exports as the picture and its text placed
+side by side and vertically centred, as preso draws them; a run of them
+shares an image column so the labels keep their left edge. Because
+PowerPoint positions everything absolutely, such a line coming from a list
+item becomes its own pair of shapes rather than staying in the list's text
+frame — it keeps its bullet, but a *numbered* item lifted this way is a list
+of one, so the numbering after it restarts (warned).
+
 ## From Slidev: what converts
 
 | Slidev | preso | Notes |
@@ -83,7 +91,7 @@ slide's kind and column structure.
 | `<a:tbl>` in a `<p:graphicFrame>` | GFM table | first row is the header |
 | `<p:pic>` (via `r:embed` → rels) | extracted file + `![](…)` | see below |
 | linked notes slide body | `<!-- note: … -->` | |
-| markdown punctuation in runs | escaped | renders verbatim |
+| markdown punctuation in runs | escaped | except intraword `_` (see below) |
 | `sldNum`/`ftr`/`dt` placeholders | dropped | preso draws its own |
 
 **Emphasis** is emitted only where a run's formatting *contrasts* with the
@@ -91,15 +99,41 @@ rest of its paragraph; a uniformly bold/italic paragraph is the base style,
 not inline emphasis, so it's left plain. Adjacent same-format runs (PowerPoint
 splits words across runs freely) are coalesced first.
 
+**Escaping** covers the punctuation that would otherwise read as formatting —
+and only where it actually could. The output is a deck someone then edits by
+hand, so `- ldr Xt, \[Rn, \#4\]` and `Fetch -\> Decode` are worse than the
+hazard they guard against, none of that being markup where it stands. Each
+character is judged in place:
+
+| character | escaped when |
+|---|---|
+| `_` | at a word boundary (`_word_`, `__init__`) — between alphanumerics CommonMark's flanking rules already read it literally, so `x86_64` and `snake_case` pass through |
+| `[` `]` | the paragraph has a `](` or `][` that could close a link; otherwise `[Rn, #4]` is text |
+| `#` | first on a line and followed by a space (an ATX opener), or trailing inside a heading (its closing run) — never in `C#` or `#4` |
+| `>` | first on a line, where it would quote |
+| `\` `` ` `` `*` `<` `\|` `~` | always — each can bite mid-text, with no flanking rule to lean on |
+
+Position matters, so each paragraph is escaped knowing where it lands: a
+heading's text, the start of a block (a bare subtitle line, or a bullet after
+its `- ` — a list item's content opens a block of its own), or plain inline
+(table cells, alt text). The rules are checked against pulldown-cmark itself,
+with the options iced's markdown widget uses: the test assembles each line as
+the converter would emit it, parses it, and requires the text to come back
+exactly as PowerPoint had it.
+
 **Images** are written to `<output-stem>.assets/` beside the output file and
 linked from the deck (so `-o talk.md` → `talk.assets/imageN.png`). With no
 `-o` (stdout) there's nowhere to write them, so they're reported as warnings
 instead. Because PowerPoint positions shapes absolutely, extracted images are
 appended after each slide's text rather than placed where they sat.
 
+SVG pictures come across as SVG: preso rasterises them at display size, so
+where PowerPoint stores a picture as a raster fallback plus an `asvg:svgBlip`
+extension, the vector is taken and the fallback left behind.
+
 Not converted (reported as per-slide warnings): charts, SmartArt, and
-embedded objects (other `<p:graphicFrame>` content), vector images
-(EMF/WMF/SVG — preso renders raster images only), plus positioning, fonts,
+embedded objects (other `<p:graphicFrame>` content), EMF/WMF vector images
+(nothing downstream decodes them), plus positioning, fonts,
 colours, transitions, and animations. A slide with no convertible content
 becomes an empty slide (dropped on load, with a warning).
 

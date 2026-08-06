@@ -19,7 +19,10 @@ their own line; they're invisible in other markdown viewers.
 | `<!-- slide: align=top \| center -->` | [Vertical alignment](../writing/alignment.md). |
 | `<!-- slide: halign=left \| center \| right -->` | [Horizontal alignment](../writing/alignment.md). |
 | `<!-- slide: background=#rrggbb -->` | Solid per-slide background colour. |
+| `<!-- slide: size=NN -->` | [Shrink one crowded slide](../writing/text-tables.md#one-slide-that-wont-fit): body text at `NN`, with headings, code and spacing in proportion. |
 | `<!-- slide: background=path.jpg -->` | [Full-bleed background image](../writing/images.md#full-bleed-backgrounds). |
+| `<!-- slide: background=… fit=cover\|contain\|stretch\|none -->` | [How the background image is scaled](../writing/images.md#fitting-the-image) (default `cover`, which crops the overhang). |
+| `<!-- slide: background=… fill=#rrggbb -->` | Colour showing where a `fit=contain` background doesn't reach (default: the theme's background). |
 | `<!-- image: path … -->` | [Positioned image](../writing/images.md#positioned-images-behind-the-text) on a layer behind the text (`position`/`width`/`opacity`/`padding`). |
 | `<!-- highlight: rect\|ellipse x= y= w= h= … -->` | [Highlight a region](../writing/images.md#highlighting-parts-of-an-image) of the next image (`color`/`opacity`/`stroke`; coordinates in % of the image). |
 | `<!-- highlight: … spotlight -->` | [Spotlight mode](../writing/images.md#spotlight-mode): dim everything *except* the region (also `mode=spotlight`). |

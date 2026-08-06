@@ -2,7 +2,8 @@ use crate::error::ParseError;
 use crate::fence;
 use crate::model::{
     Anchor, CodeBlock, Frontmatter, Highlight, HighlightMode, HighlightShape, ImageRef, ImageRow,
-    LayerImage, Layout, MathBlock, Note, Slide, SlideOverrides, Table, TableAlign,
+    ImageText, ImageTextRun, LayerImage, Layout, MathBlock, Note, Slide, SlideOverrides, Table,
+    TableAlign,
 };
 
 /// Result of parsing a deck source file.
@@ -142,6 +143,7 @@ fn process_slide(raw: &str, start_line: usize) -> Slide {
     let mut math_blocks: Vec<MathBlock> = Vec::new();
     let mut tables: Vec<Table> = Vec::new();
     let mut image_rows: Vec<ImageRow> = Vec::new();
+    let mut image_texts: Vec<ImageTextRun> = Vec::new();
     let mut layer_images: Vec<LayerImage> = Vec::new();
     let mut highlights: Vec<Vec<Highlight>> = Vec::new();
     // Set by `<!-- highlight: … -->`, attached to the next image line.
@@ -228,9 +230,18 @@ fn process_slide(raw: &str, start_line: usize) -> Slide {
                     Some(("align", value)) => overrides.align = Some(value.to_string()),
                     Some(("halign", value)) => overrides.halign = Some(value.to_string()),
                     Some(("background", value)) => overrides.background = Some(value.to_string()),
+                    // How a `background=` image is scaled, and what shows
+                    // where a `fit=contain` one doesn't reach.
+                    Some(("fit", value)) => overrides.background_fit = Some(value.to_string()),
+                    Some(("fill", value)) => overrides.background_fill = Some(value.to_string()),
                     Some(("kind", value)) => overrides.kind = Some(value.to_string()),
                     Some(("transition", value)) => overrides.transition = Some(value.to_string()),
                     Some(("number", value)) => overrides.number = value.parse().ok(),
+                    // A non-positive or unparseable size would blank the
+                    // slide, so only a sane one is taken.
+                    Some(("size", value)) => {
+                        overrides.size = value.parse().ok().filter(|s: &f32| *s > 0.0);
+                    }
                     Some(_) => {}
                     // Bare flags (no `=`).
                     None => {
@@ -348,6 +359,57 @@ fn process_slide(raw: &str, start_line: usize) -> Slide {
             });
             continue;
         }
+        // Image + text inside a list item: the marker replaces the item's
+        // content, keeping the bullet (and its indent) so the list is still a
+        // list. One item is one run — the list spaces its own items, so
+        // there's nothing to group.
+        if let Some((marker, rest)) = bullet_split(line)
+            && let Some(mut line) = image_text(rest)
+        {
+            if !pending_highlights.is_empty() {
+                push_highlight_token(&mut line.image.url, highlights.len());
+                highlights.push(std::mem::take(&mut pending_highlights));
+            }
+            push_line(
+                chunks.last_mut().expect("non-empty"),
+                &format!("{marker}![](preso-imagetext:{})", image_texts.len()),
+            );
+            image_texts.push(ImageTextRun {
+                lines: vec![line],
+                in_list: true,
+            });
+            continue;
+        }
+        // Image + text: a line carrying an image with text beside it renders
+        // as the two side by side. A run of adjacent such lines becomes one
+        // block so they stack tight and their labels share a left edge; a
+        // blank (or any other) line ends the run. A bullet ends it too — that
+        // one belongs to the list, and is handled above.
+        if let Some(first) = image_text(line) {
+            let mut run = vec![first];
+            while let Some(next) = lines
+                .peek()
+                .filter(|n| bullet_split(n).is_none())
+                .and_then(|n| image_text(n))
+            {
+                lines.next().expect("peeked");
+                run.push(next);
+            }
+            // Pending highlights attach to the run's first image.
+            if !pending_highlights.is_empty() {
+                push_highlight_token(&mut run[0].image.url, highlights.len());
+                highlights.push(std::mem::take(&mut pending_highlights));
+            }
+            push_line(
+                chunks.last_mut().expect("non-empty"),
+                &format!("![](preso-imagetext:{})", image_texts.len()),
+            );
+            image_texts.push(ImageTextRun {
+                lines: run,
+                in_list: false,
+            });
+            continue;
+        }
         // Image row: a run of two or more adjacent image-only lines renders
         // side by side. A blank (or any non-image) line ends the run, so a
         // single image, or images separated by a blank line, still stack.
@@ -444,6 +506,7 @@ fn process_slide(raw: &str, start_line: usize) -> Slide {
         math_blocks,
         tables,
         image_rows,
+        image_texts,
         layer_images,
         highlights,
         layout,
@@ -628,6 +691,67 @@ fn parse_anchor(s: &str) -> Anchor {
 fn is_image_line(line: &str) -> bool {
     let t = line.trim();
     t.starts_with("![") && t.matches("](").count() == 1 && (t.ends_with(')') || t.ends_with('}'))
+}
+
+/// Split a list item into its marker — indent, bullet or number, and the
+/// space after — and the content that follows. `None` for anything that
+/// isn't a list item. Nested items keep their indent in the marker, so
+/// putting it back in front of a replacement keeps the nesting.
+fn bullet_split(line: &str) -> Option<(&str, &str)> {
+    let indent = line.len() - line.trim_start().len();
+    let rest = &line[indent..];
+    let marker = if let Some(m) = ["- ", "* ", "+ "].iter().find(|m| rest.starts_with(**m)) {
+        m.len()
+    } else {
+        // Ordered: digits, then `.` or `)`, then a space.
+        let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+        let after = rest.get(digits..)?;
+        if digits == 0 || !(after.starts_with(". ") || after.starts_with(") ")) {
+            return None;
+        }
+        digits + 2
+    };
+    Some((&line[..indent + marker], &rest[marker..]))
+}
+
+/// Split a line carrying one image and text beside it into an [`ImageText`].
+/// The image may lead (`![icon](i.png) Label`), trail (`Label ![icon](i.png)`,
+/// how PowerPoint decks tend to read), or sit between the two. `None` when
+/// the line holds no image, or an image on its own — that stays a plain image
+/// line (see [`is_image_line`]).
+///
+/// The image ends at the first `)` after its `](`, and an attribute group
+/// counts as part of it only when glued on (`){…}`), matching what
+/// [`rewrite_image_attrs`] recognises. Whatever sits either side is the text.
+fn image_text(line: &str) -> Option<ImageText> {
+    let t = line.trim();
+    // Exactly one `](`, so a line holding two images — or an image and a
+    // link — isn't read as one image with text around it.
+    if t.matches("](").count() != 1 {
+        return None;
+    }
+    let start = t.find("![")?;
+    let open = t.find("](")? + 2;
+    // `![` has to belong to *this* `](`, not sit inside the text before it.
+    if start > open {
+        return None;
+    }
+    let mut end = open + t[open..].find(')')? + 1;
+    if t[end..].starts_with('{')
+        && let Some(brace) = t[end..].find('}')
+    {
+        end += brace + 1;
+    }
+    let before = t[..start].trim();
+    let after = t[end..].trim();
+    if before.is_empty() && after.is_empty() {
+        return None;
+    }
+    Some(ImageText {
+        image: image_ref(&t[start..end])?,
+        before: before.to_string(),
+        after: after.to_string(),
+    })
 }
 
 /// Parse an image line into a [`ImageRef`], rewriting any `{…}` attributes
@@ -932,18 +1056,17 @@ pub const MARK_SENTINEL: char = '\u{E000}';
 /// Replace `==marked==` text with sentinel-tagged inline code
 /// (`` `\u{E000}marked` ``) so the renderer can restyle it as a text
 /// highlight. Same conservative heuristics as inline math: an even number
-/// of `==` on the line, and each marked segment non-empty, free of
+/// of delimiting `==` on the line (a pair inside a code span or behind a
+/// backslash delimits nothing), and each marked segment non-empty, free of
 /// backticks, with no leading/trailing whitespace (so `a == b` stays
 /// prose).
 fn replace_marks(line: &str) -> String {
-    if !line.contains("==") {
+    let delimiters = delimiter_offsets(line, "==");
+    if delimiters.is_empty() || !delimiters.len().is_multiple_of(2) {
         return line.to_string();
     }
-    let segments: Vec<&str> = line.split("==").collect();
+    let segments = split_at_delimiters(line, &delimiters, 2);
     // segments alternate: text, mark, text, mark, ... text
-    if segments.len().is_multiple_of(2) {
-        return line.to_string(); // odd number of `==`
-    }
     let valid = segments
         .iter()
         .skip(1)
@@ -966,15 +1089,95 @@ fn replace_marks(line: &str) -> String {
     out
 }
 
+/// Byte ranges of the line covered by inline code spans: a run of backticks
+/// through the next run of the same length. Markdown reads their contents
+/// verbatim, so preso's own inline syntaxes have to leave them alone —
+/// `` `lw $t0,0($s0)` `` is assembly, not a pair of math delimiters. An
+/// unmatched run is a literal backtick and covers nothing.
+fn code_span_ranges(line: &str) -> Vec<std::ops::Range<usize>> {
+    let bytes = line.as_bytes();
+    // (offset, length) of each run of backticks, escaped ones excepted.
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'`' {
+            i += 1;
+            continue;
+        }
+        let len = bytes[i..].iter().take_while(|&&b| b == b'`').count();
+        if bytes[..i].iter().rev().take_while(|&&b| b == b'\\').count() % 2 == 0 {
+            runs.push((i, len));
+        }
+        i += len;
+    }
+    let mut ranges = Vec::new();
+    let mut open = 0;
+    while open < runs.len() {
+        let (start, len) = runs[open];
+        match (open + 1..runs.len()).find(|&c| runs[c].1 == len) {
+            Some(close) => {
+                ranges.push(start..runs[close].0 + len);
+                open = close + 1;
+            }
+            None => open += 1,
+        }
+    }
+    ranges
+}
+
+/// Byte offsets where `delimiter` really opens or closes one of preso's
+/// inline syntaxes. Two things disqualify an occurrence: sitting inside a
+/// code span, where the text is verbatim; and a backslash in front of it,
+/// which is the author saying they meant the character itself. An escape's
+/// backslash stays in the source for the markdown renderer to consume.
+fn delimiter_offsets(line: &str, delimiter: &str) -> Vec<usize> {
+    let bytes = line.as_bytes();
+    let code = code_span_ranges(line);
+    let mut offsets = Vec::new();
+    let mut from = 0;
+    while let Some(found) = line[from..].find(delimiter) {
+        let at = from + found;
+        let escaped = bytes[..at]
+            .iter()
+            .rev()
+            .take_while(|&&b| b == b'\\')
+            .count()
+            % 2
+            == 1;
+        if !escaped && !code.iter().any(|r| r.contains(&at)) {
+            offsets.push(at);
+        }
+        from = at + delimiter.len();
+    }
+    offsets
+}
+
+/// Split `line` at `offsets`, dropping the `len`-byte delimiter at each. The
+/// pieces alternate: text, delimited, text, delimited, … text.
+fn split_at_delimiters<'a>(line: &'a str, offsets: &[usize], len: usize) -> Vec<&'a str> {
+    let mut segments = Vec::with_capacity(offsets.len() + 1);
+    let mut start = 0;
+    for &at in offsets {
+        segments.push(&line[start..at]);
+        start = at + len;
+    }
+    segments.push(&line[start..]);
+    segments
+}
+
 /// Replace inline `$x^2$` math with inline-code styling so the markdown
 /// renderer shows it distinctly. Conservative heuristics: the line must
-/// contain an even number of `$`, and a math segment must be non-empty
-/// with no leading/trailing whitespace (so `$5 and $6` stays currency).
+/// contain an even number of delimiting `$` (see [`delimiter_offsets`] — one
+/// in a code span or behind a backslash doesn't count), and a math segment
+/// must be non-empty with no leading/trailing whitespace (so `$5 and $6`
+/// stays currency). Where that isn't enough — `$100-$200` has no space to
+/// give it away — `\$` says so outright.
 fn replace_inline_math(line: &str) -> String {
-    if !line.matches('$').count().is_multiple_of(2) || !line.contains('$') {
+    let delimiters = delimiter_offsets(line, "$");
+    if delimiters.is_empty() || !delimiters.len().is_multiple_of(2) {
         return line.to_string();
     }
-    let segments: Vec<&str> = line.split('$').collect();
+    let segments = split_at_delimiters(line, &delimiters, 1);
     // segments alternate: text, math, text, math, ... text
     let valid = segments
         .iter()
@@ -1031,6 +1234,11 @@ pub fn parse_note_open(trimmed: &str) -> Option<NoteOpen> {
 /// and the parsed [`CodeBlock`] info.
 ///
 /// `"```rust {2,4-6}"` → (`"```rust"`, language `rust`, annotation `{2,4-6}`)
+///
+/// The annotation is the `{…}` run and the language is whatever precedes it,
+/// so a fence can carry one without the other: an unlabelled fence annotated
+/// `{align=right}` is a right-aligned block, not a block whose *language* is
+/// `{align=right}`.
 fn clean_fence_line(line: &str) -> (String, CodeBlock) {
     let indent_len = line.len() - line.trim_start_matches(' ').len();
     let (indent, rest) = line.split_at(indent_len);
@@ -1039,13 +1247,11 @@ fn clean_fence_line(line: &str) -> (String, CodeBlock) {
     let (fence, info) = rest.split_at(fence_len);
 
     let info = info.trim();
-    let mut parts = info.splitn(2, char::is_whitespace);
-    let language = parts.next().filter(|s| !s.is_empty()).map(str::to_string);
-    let annotation = parts
-        .next()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
+    let (before_brace, annotation) = match info.find('{') {
+        Some(i) => (&info[..i], Some(info[i..].trim().to_string())),
+        None => (info, None),
+    };
+    let language = before_brace.split_whitespace().next().map(str::to_string);
 
     let cleaned = match &language {
         Some(lang) => format!("{indent}{fence}{lang}"),
@@ -1318,6 +1524,28 @@ mod tests {
     }
 
     #[test]
+    fn annotation_without_a_language() {
+        // An unlabelled fence can still be annotated — the `{…}` is the
+        // annotation, not the language name.
+        for src in [
+            "``` {align=right}\nx\n```\n",
+            "```{align=right}\nx\n```\n", // no space either
+        ] {
+            let slide = &parse(src).unwrap().slides[0];
+            assert_eq!(slide.code_blocks[0].language, None, "{src:?}");
+            assert_eq!(slide.code_blocks[0].align(), Some("right"), "{src:?}");
+            // …and the renderer sees a bare fence, not one labelled `{…}`.
+            assert!(slide.source.contains("```\n"), "{src:?}");
+            assert!(!slide.source.contains("align"), "{src:?}");
+        }
+
+        // A language with no annotation still parses as just a language.
+        let plain = &parse("```rust\nx\n```\n").unwrap().slides[0];
+        assert_eq!(plain.code_blocks[0].language.as_deref(), Some("rust"));
+        assert_eq!(plain.code_blocks[0].annotation, None);
+    }
+
+    #[test]
     fn nested_fence_content_not_treated_as_code_block() {
         // The inner ``` lines are content of the ```` fence.
         let src = "````md\n```rust {1}\n```\n````\n";
@@ -1368,6 +1596,62 @@ mod tests {
     fn currency_is_not_math() {
         let deck = parse("it costs $5 and $6 respectively\n").unwrap();
         assert!(deck.slides[0].source.contains("$5 and $6"));
+    }
+
+    #[test]
+    fn a_backslash_escapes_a_dollar() {
+        // `$100-$200` has no whitespace to mark it as currency, so it would
+        // otherwise read as math and eat both signs. Escaping says otherwise;
+        // the backslash stays for the markdown renderer to consume.
+        let deck = parse("price range \\$100-\\$200 today\n").unwrap();
+        let source = &deck.slides[0].source;
+        assert!(source.contains("\\$100-\\$200"), "{source:?}");
+        assert!(!source.contains('`'));
+
+        // One escaped delimiter of a pair leaves the other literal too —
+        // there's nothing left for it to close against.
+        let deck = parse("from \\$5 to $10 tomorrow\n").unwrap();
+        assert!(deck.slides[0].source.contains("\\$5 to $10"));
+
+        // Real math still converts, and an escaped dollar beside it is
+        // untouched.
+        let deck = parse("that is $x^2$ for \\$5\n").unwrap();
+        let source = &deck.slides[0].source;
+        assert!(source.contains("`x^2`"), "{source:?}");
+        assert!(source.contains("\\$5"));
+
+        // A literal backslash before a *delimiter* (`\\` then `$`) still
+        // opens math — the escape is on the backslash, not the dollar.
+        assert_eq!(replace_inline_math("a \\\\$x$ b"), "a \\\\`x` b");
+    }
+
+    #[test]
+    fn inline_code_is_verbatim_to_math_and_marks() {
+        // MIPS in backticks: four dollars that pair up into "math" and tear
+        // the code span apart if the span isn't respected.
+        let deck = parse("Load word: `lw $t0,0($s0)`\n").unwrap();
+        assert!(
+            deck.slides[0].source.contains("`lw $t0,0($s0)`"),
+            "{:?}",
+            deck.slides[0].source
+        );
+
+        // `==` gets the same protection: a C comparison isn't a highlight.
+        assert_eq!(replace_marks("`if (a==b==c)`"), "`if (a==b==c)`");
+
+        // Real math and marks still work outside the span on the same line.
+        let out = replace_inline_math("`$HOME` holds $x^2$ now");
+        assert_eq!(out, "`$HOME` holds `x^2` now");
+        let out = replace_marks("`a==b` but ==this== marks");
+        assert!(out.starts_with("`a==b` but "), "{out:?}");
+        assert!(out.contains(&format!("`{MARK_SENTINEL}this`")), "{out:?}");
+
+        // An unmatched backtick is a literal, not an open code span, so it
+        // must not swallow the rest of the line.
+        assert_eq!(replace_inline_math("a ` b $x$ c"), "a ` b `x` c");
+
+        // Longer runs delimit too, and pair by length.
+        assert_eq!(replace_inline_math("``a $b$ c``"), "``a $b$ c``");
     }
 
     #[test]
@@ -1460,6 +1744,38 @@ mod tests {
         assert_eq!(slide.overrides.halign.as_deref(), Some("right"));
         assert_eq!(slide.overrides.background.as_deref(), Some("#112233"));
         assert!(!slide.source.contains("slide:"));
+    }
+
+    #[test]
+    fn background_fit_and_fill_are_parsed() {
+        let deck = parse("<!-- slide: background=p.png fit=contain fill=#101418 -->\nx\n").unwrap();
+        let o = &deck.slides[0].overrides;
+        assert_eq!(o.background.as_deref(), Some("p.png"));
+        assert_eq!(o.background_fit.as_deref(), Some("contain"));
+        assert_eq!(o.background_fill.as_deref(), Some("#101418"));
+
+        // Both are optional, and absent by default.
+        let deck = parse("<!-- slide: background=p.png -->\nx\n").unwrap();
+        let o = &deck.slides[0].overrides;
+        assert_eq!(o.background_fit, None);
+        assert_eq!(o.background_fill, None);
+    }
+
+    #[test]
+    fn slide_size_is_parsed_and_validated() {
+        let deck = parse("<!-- slide: size=20 -->\n# Crowded\n").unwrap();
+        assert_eq!(deck.slides[0].overrides.size, Some(20.0));
+        // Alongside other keys, in any order.
+        let deck = parse("<!-- slide: kind=section size=24.5 -->\n# S\n").unwrap();
+        assert_eq!(deck.slides[0].overrides.size, Some(24.5));
+        assert_eq!(deck.slides[0].overrides.kind.as_deref(), Some("section"));
+        // Nonsense is dropped rather than blanking the slide.
+        for bad in ["size=0", "size=-4", "size=huge", "size="] {
+            let deck = parse(&format!("<!-- slide: {bad} -->\nx\n")).unwrap();
+            assert_eq!(deck.slides[0].overrides.size, None, "{bad}");
+        }
+        // Absent by default.
+        assert_eq!(parse("x\n").unwrap().slides[0].overrides.size, None);
     }
 
     #[test]
@@ -2063,6 +2379,123 @@ mod tests {
         assert!(deck.slides[0].image_rows.is_empty());
         assert!(deck.slides[0].source.contains("![a](a.png)"));
         assert!(deck.slides[0].source.contains("![b](b.png)"));
+    }
+
+    #[test]
+    fn image_with_text_after_it_becomes_an_image_text_run() {
+        let deck = parse(
+            "![Start](s.png){width=10%} Start a Capture\n\
+             ![Stop](t.png){width=10%} Stop a Capture\n",
+        )
+        .unwrap();
+        let slide = &deck.slides[0];
+        // The run is lifted behind one marker, so the lines stack tight.
+        assert!(slide.source.contains("![](preso-imagetext:0)"));
+        assert!(!slide.source.contains("s.png"));
+        assert_eq!(slide.image_texts.len(), 1);
+        let run = &slide.image_texts[0];
+        assert_eq!(run.lines.len(), 2);
+        // Attributes are carried through as the URL fragment, as for a row.
+        assert_eq!(run.lines[0].image.url, "s.png#preso-img=width:10");
+        assert_eq!(run.lines[0].image.alt, "Start");
+        assert_eq!(run.lines[0].after, "Start a Capture");
+        assert_eq!(run.lines[0].before, "");
+        assert_eq!(run.lines[1].after, "Stop a Capture");
+        // Not mistaken for a side-by-side image row.
+        assert!(slide.image_rows.is_empty());
+    }
+
+    #[test]
+    fn image_text_run_boundaries() {
+        // An image on its own is a plain image, not a label-less run.
+        let plain = parse("![only](one.png)\n").unwrap();
+        assert!(plain.slides[0].image_texts.is_empty());
+        assert!(plain.slides[0].source.contains("![only](one.png)"));
+
+        // A blank line ends a run, so these are two separate blocks.
+        let split = parse("![a](a.png) one\n\n![b](b.png) two\n").unwrap();
+        assert_eq!(split.slides[0].image_texts.len(), 2);
+        assert!(split.slides[0].source.contains("![](preso-imagetext:0)"));
+        assert!(split.slides[0].source.contains("![](preso-imagetext:1)"));
+
+        // So does any other line.
+        let prose = parse("![a](a.png) one\nplain prose\n").unwrap();
+        assert_eq!(prose.slides[0].image_texts.len(), 1);
+        assert_eq!(prose.slides[0].image_texts[0].lines.len(), 1);
+        assert!(prose.slides[0].source.contains("plain prose"));
+
+        // An attribute group only counts as the image's when it's glued on;
+        // detached, it reads as the start of the label.
+        let spaced = parse("![a](a.png) {width=10%} label\n").unwrap();
+        assert_eq!(spaced.slides[0].image_texts[0].lines[0].image.url, "a.png");
+        assert_eq!(
+            spaced.slides[0].image_texts[0].lines[0].after,
+            "{width=10%} label"
+        );
+
+        // Two images on one line stay out of it (as for image rows).
+        let two = parse("![a](a.png) ![b](b.png)\n").unwrap();
+        assert!(two.slides[0].image_texts.is_empty());
+
+        // An image with a link beside it isn't one image with text around it.
+        let linked = parse("see [docs](d.md) ![a](a.png)\n").unwrap();
+        assert!(linked.slides[0].image_texts.is_empty());
+    }
+
+    #[test]
+    fn text_before_the_image_is_kept() {
+        // How a PowerPoint import reads: the icon trails its label. Left in
+        // the source, iced dropped the text entirely.
+        let deck = parse("Launched by the bug icon ![Picture 3](i.png)\n").unwrap();
+        let line = &deck.slides[0].image_texts[0].lines[0];
+        assert_eq!(line.before, "Launched by the bug icon");
+        assert_eq!(line.after, "");
+        assert_eq!(line.image.url, "i.png");
+
+        // An image between two pieces of text keeps both.
+        let mid = parse("Press ![key](k.png) to start\n").unwrap();
+        let line = &mid.slides[0].image_texts[0].lines[0];
+        assert_eq!(line.before, "Press");
+        assert_eq!(line.after, "to start");
+    }
+
+    #[test]
+    fn a_list_item_keeps_its_bullet() {
+        let deck = parse(
+            "- Debugger tool ![Picture 3](i.png)\n\
+             - ![Picture 4](j.png) Icon first\n\
+             - plain bullet\n\
+             \x20 - nested ![Picture 5](k.png)\n\
+             1. ordered ![Picture 6](l.png)\n",
+        )
+        .unwrap();
+        let slide = &deck.slides[0];
+        // Each item is its own run — the list spaces its items already.
+        assert_eq!(slide.image_texts.len(), 4);
+        assert!(slide.image_texts.iter().all(|r| r.in_list));
+        assert!(slide.image_texts.iter().all(|r| r.lines.len() == 1));
+        // The marker replaces only the item's content, so the bullet (and a
+        // nested item's indent) survives.
+        assert!(slide.source.contains("- ![](preso-imagetext:0)"));
+        assert!(slide.source.contains("- plain bullet"));
+        assert!(slide.source.contains("  - ![](preso-imagetext:2)"));
+        assert!(slide.source.contains("1. ![](preso-imagetext:3)"));
+        assert_eq!(slide.image_texts[0].lines[0].before, "Debugger tool");
+        assert_eq!(slide.image_texts[1].lines[0].after, "Icon first");
+    }
+
+    #[test]
+    fn a_bullet_does_not_join_a_run_above_it() {
+        // A run groups adjacent lines to stack them tight; a list item is the
+        // list's business, so it ends the run instead of being swallowed
+        // (which would eat its bullet).
+        let deck = parse("![a](a.png) one\n- ![b](b.png) two\n").unwrap();
+        let slide = &deck.slides[0];
+        assert_eq!(slide.image_texts.len(), 2);
+        assert_eq!(slide.image_texts[0].lines.len(), 1);
+        assert!(!slide.image_texts[0].in_list);
+        assert!(slide.image_texts[1].in_list);
+        assert!(slide.source.contains("- ![](preso-imagetext:1)"));
     }
 
     #[test]

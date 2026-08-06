@@ -54,6 +54,29 @@ enum Key {
 
 type Entry = Option<(image::Handle, Size)>;
 
+/// Ceiling on the decoded frames one GIF may hold.
+///
+/// A GIF's frames are deltas, but they decode to whole-canvas RGBA — 7.8 MB
+/// apiece for a 1920×1018 screen capture — and every frame decoded is a
+/// frame held. A 71-second recording at 30fps is 2130 of them, which is
+/// 16 GB: far past what any machine will keep resident, so the renderer
+/// spends each frame evicting a texture it needs again immediately and the
+/// slide flashes. Past this budget frames are dropped instead (see
+/// [`halve`]) — choppy, but steady, and warned about.
+const GIF_FRAME_BUDGET: usize = 256 * 1024 * 1024;
+
+/// Halve a run of decoded frames, folding each dropped frame's delay into
+/// the one before it so the animation still runs to its original length.
+fn halve(frames: &mut Vec<(image::Handle, std::time::Duration)>) {
+    *frames = frames
+        .chunks(2)
+        .map(|pair| {
+            let delay = pair.iter().map(|(_, d)| *d).sum();
+            (pair[0].0.clone(), delay)
+        })
+        .collect();
+}
+
 /// A decoded, animated GIF: frames with per-frame delays.
 pub struct Gif {
     pub frames: Vec<(image::Handle, std::time::Duration)>,
@@ -81,6 +104,8 @@ pub struct Media {
     base_dir: RefCell<PathBuf>,
     cache: RefCell<HashMap<Key, Entry>>,
     gifs: RefCell<HashMap<String, Option<std::rc::Rc<Gif>>>>,
+    /// SVGs already reported as self-clipping (see `warn_if_clipped`).
+    warned_svgs: RefCell<std::collections::HashSet<String>>,
 }
 
 impl Media {
@@ -100,6 +125,7 @@ impl Media {
             base_dir: RefCell::new(base_dir_of(deck_path)),
             cache: RefCell::new(HashMap::new()),
             gifs: RefCell::new(HashMap::new()),
+            warned_svgs: RefCell::new(std::collections::HashSet::new()),
         }
     }
 
@@ -125,32 +151,73 @@ impl Media {
         let decoder = ::image::codecs::gif::GifDecoder::new(std::io::BufReader::new(file))
             .map_err(|e| tracing::warn!(error = %e, "gif decode failed"))
             .ok()?;
-        let raw_frames = decoder
-            .into_frames()
-            .collect_frames()
-            .map_err(|e| tracing::warn!(error = %e, "gif frames failed"))
-            .ok()?;
-        if raw_frames.is_empty() {
+        // Frames are taken one at a time, never collected: a frame decodes
+        // to the whole canvas, so collecting first would mean holding every
+        // one of them at once — the very thing the budget below exists to
+        // prevent, and 16 GB for a long recording.
+        let mut source_frames = 0usize;
+        let mut size = Size::ZERO;
+        let mut frames: Vec<(image::Handle, std::time::Duration)> = Vec::new();
+        let mut bytes = 0usize;
+        // Keep one source frame in every `stride`, doubling the stride each
+        // time the budget is hit — so what's held covers the whole animation
+        // rather than its opening seconds.
+        let mut stride = 1usize;
+        // Delay accumulated from frames dropped since the last one kept, so
+        // the survivors still add up to the original running time.
+        let mut pending = std::time::Duration::ZERO;
+
+        for (index, frame) in decoder.into_frames().enumerate() {
+            let frame = match frame {
+                Ok(frame) => frame,
+                // A truncated or corrupt tail: keep what decoded cleanly.
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), error = %e, "gif frames failed");
+                    break;
+                }
+            };
+            source_frames += 1;
+            pending +=
+                std::time::Duration::from(frame.delay()).max(std::time::Duration::from_millis(20));
+            if !index.is_multiple_of(stride) {
+                continue;
+            }
+            let buffer = frame.into_buffer();
+            size = Size::new(buffer.width() as f32, buffer.height() as f32);
+            bytes += buffer.len();
+            frames.push((
+                image::Handle::from_rgba(buffer.width(), buffer.height(), buffer.into_raw()),
+                std::mem::take(&mut pending),
+            ));
+            if bytes > GIF_FRAME_BUDGET {
+                halve(&mut frames);
+                bytes = bytes.div_ceil(2);
+                stride *= 2;
+            }
+        }
+        // Whatever was still accruing when the frames ran out belongs to the
+        // last one held, so a loop lasts as long as the original.
+        if let Some(last) = frames.last_mut() {
+            last.1 += pending;
+        }
+        if frames.is_empty() {
             return None;
         }
+        if stride > 1 {
+            tracing::warn!(
+                path = %path.display(),
+                source_frames,
+                held = frames.len(),
+                "GIF is too large to hold every frame ({}×{} at {:.1} MB a frame); showing \
+                 roughly every {stride}th. Convert it to a video and use `<!-- video: … -->` \
+                 to play it at full rate",
+                size.width,
+                size.height,
+                (size.width * size.height * 4.0) / 1_048_576.0,
+            );
+        }
 
-        let mut size = Size::ZERO;
-        let mut total = std::time::Duration::ZERO;
-        let frames: Vec<(image::Handle, std::time::Duration)> = raw_frames
-            .into_iter()
-            .map(|frame| {
-                let delay = std::time::Duration::from(frame.delay())
-                    .max(std::time::Duration::from_millis(20));
-                let buffer = frame.into_buffer();
-                size = Size::new(buffer.width() as f32, buffer.height() as f32);
-                total += delay;
-                (
-                    image::Handle::from_rgba(buffer.width(), buffer.height(), buffer.into_raw()),
-                    delay,
-                )
-            })
-            .collect();
-
+        let total = frames.iter().map(|(_, delay)| *delay).sum();
         Some(std::rc::Rc::new(Gif {
             frames,
             size,
@@ -234,10 +301,26 @@ impl Media {
     /// Slide image (`![alt](path)`), resolved relative to the deck file.
     /// SVG files are rasterized (at `target_width` logical pixels when a
     /// `{width=NN%}` attribute was given); bitmaps load via iced directly.
-    pub fn slide_image(&self, url: &str, target_width: Option<f32>) -> Entry {
+    ///
+    /// `scale` is the render scale, and matters for an SVG with no width
+    /// attribute: its size then comes from the file's own units, which have
+    /// to be read as design units — a bitmap's pixels are (`build_image`
+    /// multiplies those by the same scale), and so are a Mermaid diagram's.
+    /// Rasterizing such an SVG at a fixed 1.0 pinned it to logical pixels
+    /// instead, so it held its size while the slide around it grew or shrank
+    /// with the window — the same picture covering a different share of the
+    /// slide on screen than on an exported page.
+    pub fn slide_image(&self, url: &str, target_width: Option<f32>, scale: f32) -> Entry {
+        // An unsized SVG's raster depends on the scale, so the cache has to
+        // tell those apart; everything else is scale-independent.
+        let unsized_svg = target_width.is_none() && url.to_ascii_lowercase().ends_with(".svg");
         let key = Key::Image {
             path: url.to_string(),
-            px: target_width.map_or(0, |w| w.round() as u32),
+            px: match (target_width, unsized_svg) {
+                (Some(w), _) => w.round() as u32,
+                (None, true) => (scale * 100.0).round() as u32,
+                (None, false) => 0,
+            },
         };
         self.lookup(key, || {
             if url.contains("://") {
@@ -254,11 +337,46 @@ impl Media {
                 .is_some_and(|e| e.eq_ignore_ascii_case("svg"))
             {
                 let svg = std::fs::read_to_string(&path).ok()?;
-                self.svg_entry(&svg, target_width, 1.0)
+                self.warn_if_clipped(url, &svg);
+                self.svg_entry(&svg, target_width, scale)
             } else {
                 load_bitmap(&path)
             }
         })
+    }
+
+    /// Say so when an SVG's own canvas cuts its content off, which is
+    /// otherwise a silent slice off one edge that no amount of `{width=NN%}`
+    /// will fix — the clipping happens inside the file's coordinate space,
+    /// so resizing scales the crop along with everything else.
+    ///
+    /// Once per file: the same image is re-rasterized per display size, and
+    /// the deck is re-rendered constantly.
+    fn warn_if_clipped(&self, url: &str, svg: &str) {
+        if self.warned_svgs.borrow().contains(url) {
+            return;
+        }
+        self.warned_svgs.borrow_mut().insert(url.to_string());
+        let Ok(overflow) = self.renderer.svg_overflow(svg) else {
+            return;
+        };
+        if !overflow.is_clipped() {
+            return;
+        }
+        let spill = overflow
+            .sides()
+            .iter()
+            .map(|(side, units)| format!("{units:.0} past the {side}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        tracing::warn!(
+            image = url,
+            "SVG content is clipped by the canvas the file itself declares ({spill}, in the \
+             file's own units). Usually a missing font: the file names one this machine hasn't \
+             got, the substitute is wider, and it overruns a canvas measured for the original. \
+             Resizing the image can't help — widen `width`/`height` on the <svg> element, or \
+             convert its text to paths"
+        );
     }
 
     /// Like [`Self::slide_image`], but with the highlight `ops` composited
@@ -269,7 +387,13 @@ impl Media {
     /// channel, so we bake the wash into the pixels instead. Cached by
     /// `(path, px, ops)`; unsupported for remote and animated-GIF images
     /// (returns `None`, so the caller falls back to the canvas overlay).
-    pub fn masked_image(&self, url: &str, target_width: Option<f32>, ops: &[MaskOp]) -> Entry {
+    pub fn masked_image(
+        &self,
+        url: &str,
+        target_width: Option<f32>,
+        scale: f32,
+        ops: &[MaskOp],
+    ) -> Entry {
         use std::hash::{Hash, Hasher};
         if ops.is_empty() {
             return None;
@@ -280,11 +404,11 @@ impl Media {
         }
         let key = Key::MaskedImage {
             path: url.to_string(),
-            px: target_width.map_or(0, |w| w.round() as u32),
+            px: target_width.map_or_else(|| (scale * 100.0).round() as u32, |w| w.round() as u32),
             ops: hasher.finish(),
         };
         self.lookup(key, || {
-            let (mut rgba, w, h, logical) = self.decode_rgba(url, target_width)?;
+            let (mut rgba, w, h, logical) = self.decode_rgba(url, target_width, scale)?;
             composite_mask(&mut rgba, w, h, ops);
             Some((image::Handle::from_rgba(w, h, rgba), logical))
         })
@@ -298,6 +422,7 @@ impl Media {
         &self,
         url: &str,
         target_width: Option<f32>,
+        scale: f32,
     ) -> Option<(Vec<u8>, u32, u32, Size)> {
         if url.contains("://") {
             return None;
@@ -311,14 +436,14 @@ impl Media {
             .is_some_and(|e| e.eq_ignore_ascii_case("svg"))
         {
             let svg = std::fs::read_to_string(&path).ok()?;
-            let scale = match target_width {
+            let raster_scale = match target_width {
                 Some(width) => {
                     let (intrinsic_w, _) = self.renderer.svg_size(&svg).ok()?;
                     (width / intrinsic_w) * OVERSAMPLE
                 }
-                None => OVERSAMPLE,
+                None => scale * OVERSAMPLE,
             };
-            let raster = self.renderer.rasterize(&svg, scale).ok()?;
+            let raster = self.renderer.rasterize(&svg, raster_scale).ok()?;
             let logical = Size::new(
                 raster.width as f32 / OVERSAMPLE,
                 raster.height as f32 / OVERSAMPLE,
@@ -731,5 +856,79 @@ mod tests {
         let a = dithered_gradient_rgba(gradient(160.0), 128, 72);
         let b = dithered_gradient_rgba(gradient(160.0), 128, 72);
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn an_unsized_svg_is_measured_in_design_units() {
+        // A picture with no `{width=NN%}` should cover the same share of the
+        // slide however big the window is — which means its size has to come
+        // back scaled, since `build_image` uses a vector's size as-is. Pinned
+        // at 1.0 instead, the same SVG covered a different share of the slide
+        // on screen than on an exported page.
+        let dir = std::env::temp_dir().join(format!("preso-svg-scale-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let svg = dir.join("box.svg");
+        std::fs::write(
+            &svg,
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="400" height="200">
+                 <rect width="400" height="200" fill="#000"/></svg>"##,
+        )
+        .unwrap();
+        let media = Media::new(&dir.join("deck.md"));
+
+        let size = |scale: f32| media.slide_image("box.svg", None, scale).unwrap().1;
+        // Export renders at 1.0: the file's own units, unchanged.
+        assert_eq!(size(1.0), Size::new(400.0, 200.0));
+        // A window twice the design width doubles it, as a bitmap's natural
+        // pixels are doubled by the same scale in `build_image`.
+        assert_eq!(size(2.0), Size::new(800.0, 400.0));
+        // …and a smaller window shrinks it in step.
+        assert_eq!(size(0.5), Size::new(200.0, 100.0));
+
+        // An explicit width still wins outright, at any scale.
+        let sized = media.slide_image("box.svg", Some(300.0), 2.0).unwrap().1;
+        assert_eq!(sized.width, 300.0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn halving_frames_keeps_the_running_time() {
+        use std::time::Duration;
+        let frames = |n: usize| -> Vec<(image::Handle, Duration)> {
+            (0..n)
+                .map(|i| {
+                    // A distinct pixel per frame, so identity is checkable.
+                    let handle = image::Handle::from_rgba(1, 1, vec![i as u8, 0, 0, 255]);
+                    (handle, Duration::from_millis(100))
+                })
+                .collect()
+        };
+        let total =
+            |f: &[(image::Handle, Duration)]| -> Duration { f.iter().map(|(_, d)| *d).sum() };
+
+        // Even count: pairs collapse, each survivor covering both delays.
+        let mut even = frames(4);
+        let before = total(&even);
+        halve(&mut even);
+        assert_eq!(even.len(), 2);
+        assert_eq!(total(&even), before);
+        assert!(even.iter().all(|(_, d)| *d == Duration::from_millis(200)));
+
+        // Odd count: the last frame has no partner and keeps its own delay.
+        let mut odd = frames(5);
+        let before = total(&odd);
+        halve(&mut odd);
+        assert_eq!(odd.len(), 3);
+        assert_eq!(total(&odd), before);
+        assert_eq!(odd[2].1, Duration::from_millis(100));
+
+        // Halving repeatedly still can't lose or invent time.
+        let mut many = frames(9);
+        let before = total(&many);
+        halve(&mut many);
+        halve(&mut many);
+        assert_eq!(many.len(), 3);
+        assert_eq!(total(&many), before);
     }
 }

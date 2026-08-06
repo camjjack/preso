@@ -4,7 +4,8 @@
 //! `::title::` for the `two-cols-header` header). preso splits a TwoColumn
 //! slide at a single `***` line, with no header slot — so `::right::` becomes
 //! `***`, `::left::` is dropped, and `::title::` content stays inline above
-//! the columns (with a warning).
+//! the columns (with a warning): a heading there ends up spanning both
+//! columns anyway, since preso hoists a lone two-column heading.
 
 use super::{Rule, SlideCtx};
 
@@ -40,7 +41,10 @@ impl Rule for Columns {
             ));
         }
         if had_title {
-            ctx.warn("`::title::` header kept inline above the columns");
+            ctx.warn(
+                "`::title::` header moved above the columns — a heading there spans both, \
+                 anything else joins the left column",
+            );
         }
         ctx.body = out.trim_end().to_string();
     }

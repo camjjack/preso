@@ -61,7 +61,8 @@ impl Rule for Layout {
             "two-cols-header" => {
                 ctx.layout = Some("TwoColumn".to_string());
                 ctx.warn(
-                    "layout 'two-cols-header': header (::title::) kept inline above the columns",
+                    "layout 'two-cols-header': the `::title::` header moves above the columns — \
+                     a heading there spans both, anything else joins the left column",
                 );
             }
             "image-left" | "image-right" => image_columns(ctx, &layout),

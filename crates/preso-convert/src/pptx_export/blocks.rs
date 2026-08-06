@@ -30,6 +30,14 @@ pub enum Block {
     Table(usize),
     /// `![](preso-imagerow:N)` marker → `Slide::image_rows[N]`.
     ImageRow(usize),
+    /// `![](preso-imagetext:N)` marker → `Slide::image_texts[N]`: images with
+    /// the text beside them.
+    ImageText {
+        index: usize,
+        /// `(level, ordered)` when the marker was a list item's whole
+        /// content, so the text can keep its bullet.
+        list: Option<(u8, bool)>,
+    },
 }
 
 #[derive(Debug, PartialEq)]
@@ -151,6 +159,16 @@ pub fn parse_blocks(source: &str) -> Vec<Block> {
             continue;
         }
 
+        // A list item that is nothing but an image-text marker: its own
+        // block, since the picture needs placing beside its own text.
+        if let Some(block) = list_marker(line) {
+            flush_para(&mut para, &mut blocks);
+            flush_list(&mut list, &mut blocks);
+            flush_quote(&mut quote, &mut blocks);
+            blocks.push(block);
+            continue;
+        }
+
         // List item (bulleted or numbered), nesting from indentation.
         if let Some(item) = list_item(line) {
             flush_para(&mut para, &mut blocks);
@@ -195,7 +213,8 @@ pub fn parse_blocks(source: &str) -> Vec<Block> {
 }
 
 /// `![math](preso-math:N)` / `![table](preso-table:N)` /
-/// `![](preso-imagerow:N)` → the corresponding marker block.
+/// `![](preso-imagerow:N)` / `![](preso-imagetext:N)` → the corresponding
+/// marker block.
 fn marker(trimmed: &str) -> Option<Block> {
     let (_, url) = whole_line_image(trimmed)?;
     if let Some(n) = url.strip_prefix("preso-math:") {
@@ -207,7 +226,29 @@ fn marker(trimmed: &str) -> Option<Block> {
     if let Some(n) = url.strip_prefix("preso-imagerow:") {
         return n.parse().ok().map(Block::ImageRow);
     }
+    if let Some(n) = url.strip_prefix("preso-imagetext:") {
+        return n
+            .parse()
+            .ok()
+            .map(|index| Block::ImageText { index, list: None });
+    }
     None
+}
+
+/// A list item whose whole content is an image-text marker — the parser
+/// leaves the bullet in place and lifts only what follows it. The item can't
+/// stay in the list shape (a picture has to be placed beside its own text),
+/// so it becomes a block of its own that remembers the bullet it had.
+fn list_marker(line: &str) -> Option<Block> {
+    let (marker_len, level, ordered) = list_prefix(line)?;
+    let rest = line.trim_start()[marker_len..].trim();
+    match marker(rest) {
+        Some(Block::ImageText { index, .. }) => Some(Block::ImageText {
+            index,
+            list: Some((level, ordered)),
+        }),
+        _ => None,
+    }
 }
 
 fn heading(trimmed: &str) -> Option<(u8, &str)> {
@@ -222,30 +263,27 @@ fn heading(trimmed: &str) -> Option<(u8, &str)> {
 }
 
 fn list_item(line: &str) -> Option<ListItem> {
+    let (marker_len, level, ordered) = list_prefix(line)?;
+    Some(ListItem {
+        level,
+        ordered,
+        runs: parse_inlines(line.trim_start()[marker_len..].trim()),
+    })
+}
+
+/// A list item's marker: `(its byte length, nesting level, ordered)`.
+/// Measured from the trimmed line, with the level from the indentation.
+fn list_prefix(line: &str) -> Option<(usize, u8, bool)> {
     let indent = line.len() - line.trim_start().len();
     let trimmed = line.trim_start();
     let level = (indent / 2).min(4) as u8;
-    if let Some(rest) = trimmed
-        .strip_prefix("- ")
-        .or_else(|| trimmed.strip_prefix("* "))
-        .or_else(|| trimmed.strip_prefix("+ "))
-    {
-        return Some(ListItem {
-            level,
-            ordered: false,
-            runs: parse_inlines(rest.trim()),
-        });
+    if ["- ", "* ", "+ "].iter().any(|m| trimmed.starts_with(m)) {
+        return Some((2, level, false));
     }
     // `1. ` numbered items.
     let digits = trimmed.bytes().take_while(u8::is_ascii_digit).count();
-    if digits > 0
-        && let Some(rest) = trimmed[digits..].strip_prefix(". ")
-    {
-        return Some(ListItem {
-            level,
-            ordered: true,
-            runs: parse_inlines(rest.trim()),
-        });
+    if digits > 0 && trimmed[digits..].starts_with(". ") {
+        return Some((digits + 2, level, true));
     }
     None
 }
@@ -288,11 +326,42 @@ pub fn parse_inlines(text: &str) -> Vec<Run> {
         }
     }
     emphasis(rest, false, false, &mut runs);
+    // Markdown's backslash escapes have done their job by now — they kept the
+    // parser off punctuation the author meant literally (`\$100`, `\_word\_`,
+    // which is exactly what the PowerPoint *importer* writes). PowerPoint has
+    // no such convention, so the backslash has to go or it shows up on the
+    // slide. Code spans are verbatim and keep theirs.
+    for run in &mut runs {
+        if !run.code {
+            run.text = unescape_md(&run.text);
+        }
+    }
     runs.retain(|r| !r.text.is_empty());
     if runs.is_empty() {
         runs.push(Run::plain(""));
     }
     runs
+}
+
+/// Drop the backslash from a markdown escape — `\<punctuation>` → that
+/// character. A backslash before anything else isn't an escape and stands.
+fn unescape_md(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.clone().next() {
+            Some(next) if next.is_ascii_punctuation() => {
+                out.push(next);
+                chars.next();
+            }
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 /// Emphasis + links within a code-free segment. The earliest construct in
@@ -352,8 +421,9 @@ fn find_link(text: &str) -> Option<(usize, &str, &str, &str)> {
 fn find_span(text: &str) -> Option<(usize, &str, &str, bool)> {
     let mut best: Option<(usize, &str, &str, bool)> = None;
     for (open, is_bold) in [("**", true), ("*", false), ("_", false)] {
-        if let Some(start) = text.find(open)
-            && let Some(len) = text[start + open.len()..].find(open)
+        if let Some(start) = find_delimiter(text, open, 0)
+            && let Some(len) =
+                find_delimiter(text, open, start + open.len()).map(|at| at - start - open.len())
             && len > 0
             && best.as_ref().is_none_or(|b| start < b.0)
         {
@@ -366,6 +436,43 @@ fn find_span(text: &str) -> Option<(usize, &str, &str, bool)> {
         }
     }
     best
+}
+
+/// Byte offset of the next `delimiter` at or after `from` that really marks
+/// emphasis. Two things disqualify one, both of which the PowerPoint
+/// *importer* relies on when it writes markdown back out:
+///
+/// - a backslash before it — `\_word\_` is a literal underscore either side;
+/// - for `_` only, alphanumerics on both sides. CommonMark's flanking rules
+///   don't let an underscore inside a word open or close emphasis, which is
+///   what keeps `snake_case_fn` from turning into "snake *case* fn".
+fn find_delimiter(text: &str, delimiter: &str, from: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut at = from;
+    while let Some(found) = text.get(at..)?.find(delimiter) {
+        let start = at + found;
+        let escaped = bytes[..start]
+            .iter()
+            .rev()
+            .take_while(|&&b| b == b'\\')
+            .count()
+            % 2
+            == 1;
+        let intraword = delimiter == "_"
+            && text[..start]
+                .chars()
+                .next_back()
+                .is_some_and(char::is_alphanumeric)
+            && text[start + delimiter.len()..]
+                .chars()
+                .next()
+                .is_some_and(char::is_alphanumeric);
+        if !escaped && !intraword {
+            return Some(start);
+        }
+        at = start + delimiter.len();
+    }
+    None
 }
 
 #[cfg(test)]
@@ -390,6 +497,73 @@ mod tests {
         assert!(matches!(&blocks[4], Block::Quote(lines) if lines.len() == 1));
         assert!(matches!(&blocks[5], Block::Math(0)));
         assert!(matches!(&blocks[6], Block::Image { url, .. } if url.starts_with("x.png")));
+    }
+
+    #[test]
+    fn escaped_and_intraword_punctuation_is_not_emphasis() {
+        let text = |runs: &[Run]| runs.iter().map(|r| r.text.as_str()).collect::<String>();
+
+        // What the PowerPoint importer writes for literal punctuation has to
+        // survive the trip back out: the backslash goes (PowerPoint has no
+        // such convention) and nothing turns italic on the way.
+        let runs = parse_inlines("the \\_emphasis\\_ case");
+        assert_eq!(text(&runs), "the _emphasis_ case");
+        assert!(runs.iter().all(|r| !r.italic));
+
+        // An underscore inside a word never opened emphasis in markdown, and
+        // must not here either.
+        let runs = parse_inlines("call snake_case_fn now");
+        assert_eq!(text(&runs), "call snake_case_fn now");
+        assert!(runs.iter().all(|r| !r.italic));
+
+        // Escaped dollars lose their backslash too (preso-core leaves it in
+        // the source for the markdown renderer, which PowerPoint isn't).
+        assert_eq!(
+            text(&parse_inlines("costs \\$100-\\$200")),
+            "costs $100-$200"
+        );
+
+        // Emphasis at a word boundary still works, as does bold.
+        let runs = parse_inlines("an _italic_ and **bold** word");
+        assert!(runs.iter().any(|r| r.text == "italic" && r.italic));
+        assert!(runs.iter().any(|r| r.text == "bold" && r.bold));
+
+        // A code span is verbatim: its backslashes are content.
+        let runs = parse_inlines("run `printf \\$1` here");
+        assert!(runs.iter().any(|r| r.code && r.text == "printf \\$1"));
+    }
+
+    #[test]
+    fn image_text_markers_become_blocks() {
+        // Standing on its own, and as a list item's whole content — the
+        // parser leaves the bullet in place and lifts only what follows it.
+        let blocks = parse_blocks(
+            "![](preso-imagetext:0)\n\n- ![](preso-imagetext:1)\n  1. ![](preso-imagetext:2)\n- plain\n",
+        );
+        assert!(matches!(
+            &blocks[0],
+            Block::ImageText {
+                index: 0,
+                list: None
+            }
+        ));
+        assert!(matches!(
+            &blocks[1],
+            Block::ImageText {
+                index: 1,
+                list: Some((0, false))
+            }
+        ));
+        // The bullet it had comes with it, nesting level and all.
+        assert!(matches!(
+            &blocks[2],
+            Block::ImageText {
+                index: 2,
+                list: Some((1, true))
+            }
+        ));
+        // An ordinary item after one still forms a list.
+        assert!(matches!(&blocks[3], Block::List(items) if items.len() == 1));
     }
 
     #[test]

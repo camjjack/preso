@@ -17,6 +17,59 @@ pub struct Column {
     slide: preso_core::Slide,
 }
 
+/// A two-column slide's rendered split: the two columns, plus the heading
+/// band above them when only one side led with a heading (see
+/// [`preso_core::model::split_column_header`]) — in which case that
+/// heading has been taken out of `left`/`right`.
+pub struct Columns {
+    header: Option<markdown::Content>,
+    left: Column,
+    right: Column,
+}
+
+impl Columns {
+    /// Lay this split out as a slide body. `render_one` is the caller's
+    /// markdown renderer — `(content, code_slide)`, since each column's
+    /// code-block annotations come from its own sub-slide — so the live
+    /// views (interactive links) and the export renderer (inert) share one
+    /// layout. `portions` is the slide's `left:right` ratio.
+    pub(crate) fn body<'a, F>(
+        &'a self,
+        render_one: F,
+        portions: (u16, u16),
+        theme: &preso_style::Theme,
+        scale: f32,
+    ) -> Element<'a, Message>
+    where
+        F: Fn(&'a markdown::Content, &'a preso_core::Slide) -> Element<'a, Message>,
+    {
+        // A hoisted header leaves neither column leading with a heading, so
+        // the in-column band alignment only applies without one: it keeps a
+        // heading on each side from leaving the shorter one's body floating
+        // up beside the other.
+        let pads = match self.header {
+            Some(_) => (0.0, 0.0),
+            None => render::column_header_pads(
+                self.left.slide.leading_heading_level(),
+                self.right.slide.leading_heading_level(),
+                theme,
+                scale,
+            ),
+        };
+        render::two_column_body(
+            self.header
+                .as_ref()
+                .map(|header| render_one(header, &self.left.slide)),
+            render_one(&self.left.content, &self.left.slide),
+            render_one(&self.right.content, &self.right.slide),
+            pads,
+            portions,
+            theme,
+            scale,
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
     Presenter,
@@ -87,7 +140,7 @@ pub struct App {
     pub current_md: markdown::Content,
     /// Two-column split of the current step, when the slide uses
     /// `<!-- layout: TwoColumn -->`.
-    current_cols: Option<(Column, Column)>,
+    current_cols: Option<Columns>,
     /// Markdown content for the next slide (fully revealed).
     pub next_md: Option<markdown::Content>,
     /// Markdown for the current slide's *next reveal step*, when the slide
@@ -95,10 +148,10 @@ pub struct App {
     next_preview_md: Option<markdown::Content>,
     /// Two-column split for whatever the "Next" panel previews (the current
     /// slide's next step, or the next slide), when it's a TwoColumn slide.
-    next_cols: Option<(Column, Column)>,
+    next_cols: Option<Columns>,
     /// Per-slide two-column splits for the overview grid (parsed lazily with
     /// `overview_md`); `None` for single-column slides.
-    overview_cols: Option<Vec<Option<(Column, Column)>>>,
+    overview_cols: Option<Vec<Option<Columns>>>,
     /// Rendered-media cache (math, mermaid, images).
     pub media: Media,
     /// Sticky banner: last hot-reload/parse problem (presenter-only display).
@@ -203,22 +256,25 @@ fn overview_scroll_y(current_index: usize, total: usize, columns: usize) -> f32 
     (current_row as f32 / (num_rows - 1) as f32).clamp(0.0, 1.0)
 }
 
-/// Parse a [`Slide::column_slides`] split into the two [`Column`]s the views
-/// render (each side's markdown content plus its re-parsed sub-slide).
-fn columns_of(
+/// Parse a [`preso_core::Slide::column_slides`] split into the [`Columns`]
+/// the views render (each side's markdown content plus its re-parsed
+/// sub-slide), hoisting a lone leading heading into the shared header band.
+pub(crate) fn columns_of(
     split: ((String, preso_core::Slide), (String, preso_core::Slide)),
-) -> (Column, Column) {
+) -> Columns {
     let ((ls, lslide), (rs, rslide)) = split;
-    (
-        Column {
+    let (header, ls, rs) = preso_core::model::split_column_header(&ls, &rs);
+    Columns {
+        header: header.map(|h| markdown::Content::parse(&h)),
+        left: Column {
             content: markdown::Content::parse(&ls),
             slide: lslide,
         },
-        Column {
+        right: Column {
             content: markdown::Content::parse(&rs),
             slide: rslide,
         },
-    )
+    }
 }
 
 /// A subscription that ticks every `period`, driven by a dedicated thread.
@@ -466,7 +522,7 @@ impl App {
         &'a self,
         slide: &'a preso_core::Slide,
         content: &'a markdown::Content,
-        cols: Option<&'a (Column, Column)>,
+        cols: Option<&'a Columns>,
         scale: f32,
         scale_factor: f32,
         step: usize,
@@ -482,7 +538,9 @@ impl App {
                 scale,
                 animation_time: self.animation_time(),
                 halign: render::resolve_halign(&slide.overrides, self.slide_theme(slide)),
+                text_scale: render::resolve_text_scale(&slide.overrides, self.slide_theme(slide)),
                 step,
+                code_stage: None,
                 scale_factor,
                 authoring,
             };
@@ -493,29 +551,13 @@ impl App {
             }
         };
         match cols {
-            Some((left, right)) => {
-                // Align the columns' bodies under a shared header band so a
-                // heading on one side doesn't leave the other's body
-                // floating up beside it.
-                let (lp, rp) = render::column_header_pads(
-                    left.slide.leading_heading_level(),
-                    right.slide.leading_heading_level(),
-                    self.slide_theme(slide),
-                    scale,
-                );
+            Some(cols) => cols.body(
+                render_one,
                 // Per-slide column ratio (`<!-- layout: TwoColumn 2:1 -->`).
-                let (lw, rw) = slide.layout.column_portions().unwrap_or((1, 1));
-                row![
-                    iced::widget::container(render_one(&left.content, &left.slide))
-                        .width(iced::FillPortion(lw))
-                        .padding(iced::padding::top(lp)),
-                    iced::widget::container(render_one(&right.content, &right.slide))
-                        .width(iced::FillPortion(rw))
-                        .padding(iced::padding::top(rp)),
-                ]
-                .spacing(40.0 * scale)
-                .into()
-            }
+                slide.layout.column_portions().unwrap_or((1, 1)),
+                self.slide_theme(slide),
+                scale,
+            ),
             None => render_one(content, slide),
         }
     }
@@ -1707,6 +1749,51 @@ mod tests {
         let cols = app.overview_cols.expect("overview cols cached");
         assert!(cols[0].is_none(), "single-column slide has no split");
         assert!(cols[1].is_some(), "two-column slide is split");
+    }
+
+    #[test]
+    fn lone_two_column_heading_becomes_a_full_width_band() {
+        let cols = |body: &str| {
+            let mut app = app(&format!("<!-- layout: TwoColumn -->\n\n{body}"));
+            app.refresh_markdown();
+            app.current_cols.expect("two-column slide is split")
+        };
+
+        // One heading: hoisted out of its column into the shared band, so it
+        // wraps against the whole slide rather than one column's width.
+        let one = cols("## Sequence Number\n\n![](i.png)\n\n***\n\n- a\n- b\n");
+        assert!(one.header.is_some(), "lone heading is hoisted");
+        // …from either side.
+        let right = cols("![](i.png)\n\n***\n\n## Notes\n\n- a\n");
+        assert!(right.header.is_some(), "a right-only heading hoists too");
+
+        // A heading per column stays in its column (aligned by the pads).
+        let two = cols("## Before\n\nx\n\n***\n\n## After\n\ny\n");
+        assert!(two.header.is_none(), "per-column headings stay put");
+        let none = cols("x\n\n***\n\ny\n");
+        assert!(none.header.is_none(), "no heading, no band");
+
+        // The hoist survives into the rendered views.
+        let mut app = app("<!-- layout: TwoColumn 2:1 -->\n\n## Wide\n\nx\n\n***\n\ny\n");
+        app.refresh_markdown();
+        let _ = presenter::view(&app, window::Id::unique());
+        let _ = audience::view(&app, window::Id::unique());
+    }
+
+    /// `![](icon.png) label` lines render through the same view path as any
+    /// other block, including the branches a deck hits in practice: sized
+    /// images (labels aligned), an unsized one (capped), and a missing file
+    /// (alt-text fallback).
+    #[test]
+    fn views_build_for_image_labels() {
+        let mut app = app("## Icons\n\n\
+             ![start](a.png){width=6%} Start a capture\n\
+             ![stop](b.png){width=6%} Stop a capture\n\n\
+             ![lone](c.png) Unsized, and the file is missing\n");
+        app.refresh_markdown();
+        assert_eq!(app.deck.current_slide().image_texts.len(), 2);
+        let _ = presenter::view(&app, window::Id::unique());
+        let _ = audience::view(&app, window::Id::unique());
     }
 
     #[test]

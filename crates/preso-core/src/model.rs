@@ -194,6 +194,37 @@ pub struct ImageRef {
     pub alt: String,
 }
 
+/// A run of `![alt](url) label` lines — an image with its text beside it,
+/// one per line — lifted out so the renderer can place them side by side.
+/// iced's markdown widget treats an image as a block, so left in the source
+/// the label would break onto its own line (and a second such line would
+/// lose its text entirely). Referenced as `![](preso-imagetext:<index>)`,
+/// the same marker scheme as tables and image rows.
+///
+/// A run is one block so the lines stack tight, with the labels sharing a
+/// left edge.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImageTextRun {
+    pub lines: Vec<ImageText>,
+    /// The run is the content of a list item, so it carries no block padding
+    /// of its own — the list already spaces its items — and holds the one
+    /// line.
+    pub in_list: bool,
+}
+
+/// One line of image-with-text: the image, and whatever text sat on either
+/// side of it. At least one side is non-empty (an image alone stays a plain
+/// image line). Both sides take the inline markdown a table cell does
+/// (`` `code` ``, `**bold**`, `==mark==`, `<br>`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImageText {
+    pub image: ImageRef,
+    /// Text before the image on that line, trimmed; empty if it led.
+    pub before: String,
+    /// Text after the image on that line, trimmed; empty if it trailed.
+    pub after: String,
+}
+
 /// A `<!-- image: … -->` decoration placed on a layer between the slide
 /// background and its content, so any overlapping text stays on top.
 /// Positioned and sized like the theme logo, but authored per slide.
@@ -309,9 +340,11 @@ impl Layout {
 }
 
 /// Per-slide style overrides from `<!-- slide: key=value ... -->`.
-/// Values stay as strings; the renderer interprets them, keeping this
-/// crate style-agnostic.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// Values stay as strings where the meaning is the renderer's to decide,
+/// keeping this crate style-agnostic; the numeric ones are parsed here so a
+/// malformed directive is dropped once, at the source. (`Eq` is out because
+/// of the float; `is_empty` only ever needs `PartialEq`.)
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct SlideOverrides {
     /// `align=top|center`
     pub align: Option<String>,
@@ -335,6 +368,24 @@ pub struct SlideOverrides {
     /// on this at the end of parsing, so it is never seen downstream; it
     /// lives here only so the directive parser has somewhere to record it.
     pub hidden: bool,
+    /// `fit=cover|contain` — how a `background=` **image** is scaled onto the
+    /// slide. `cover` (the default) fills the slide and crops whatever
+    /// overhangs, which for a square image on a 16:9 slide means the top and
+    /// bottom. `contain` scales it until the whole picture fits, leaving bars
+    /// of [`Self::background_fill`] where it doesn't reach. No effect on a
+    /// colour background.
+    pub background_fit: Option<String>,
+    /// `fill=#rrggbb` — the colour behind a `fit=contain` background image,
+    /// for the space it doesn't cover. Defaults to the theme's background
+    /// colour, so the picture sits on the slide's usual backdrop.
+    pub background_fill: Option<String>,
+    /// `size=NN` — body text size for this slide, in the same units as a
+    /// theme's `fonts.body_size`, for the slide that holds a little more
+    /// than fits. Headings, code and paragraph spacing move with it, in
+    /// proportion, so the slide keeps its shape as it shrinks. Matches the
+    /// per-table (`<!-- table: size=NN -->`) and per-fence (`{size=NN}`)
+    /// escape hatches.
+    pub size: Option<f32>,
 }
 
 impl SlideOverrides {
@@ -412,6 +463,9 @@ pub struct Slide {
     /// Rows of side-by-side images in document order, referenced as
     /// `![](preso-imagerow:<index>)`.
     pub image_rows: Vec<ImageRow>,
+    /// Runs of `![](icon.png) label` lines in document order, referenced as
+    /// `![](preso-imagetext:<index>)`.
+    pub image_texts: Vec<ImageTextRun>,
     /// Decoration images placed below the content layer (`<!-- image: … -->`).
     pub layer_images: Vec<LayerImage>,
     /// Highlight groups (`<!-- highlight: … -->`), one per annotated image.
@@ -543,10 +597,77 @@ pub fn leading_heading_level(source: &str) -> Option<u8> {
     }
 }
 
+/// Split `source` into its leading ATX heading line and everything after
+/// it, or `None` when `source` doesn't open with a heading.
+fn split_leading_heading(source: &str) -> Option<(String, String)> {
+    leading_heading_level(source)?;
+    let mut lines = source.lines();
+    let heading = lines.find(|l| !l.trim().is_empty())?.to_string();
+    let mut rest = lines.collect::<Vec<_>>().join("\n");
+    if !rest.is_empty() {
+        rest.push('\n');
+    }
+    Some((heading, rest))
+}
+
+/// Decide how a [`Layout::TwoColumn`] split's headings are laid out.
+///
+/// A heading that leads one column and has no counterpart on the other side
+/// reads as the slide's heading rather than that column's, so it is hoisted
+/// out into a band above both columns — where it can use the full slide
+/// width instead of wrapping inside one column.
+///
+/// Headings of the *same* level on both sides are a heading each and stay
+/// put. Different levels are the giveaway that the senior one belongs to the
+/// slide: writing
+///
+/// ```markdown
+/// ## if (expr) {} else {}
+///
+/// ### Pseudo code
+/// ***
+/// ### AArch64 assembly
+/// ```
+///
+/// puts the `##` at the top of the left column only because that is where
+/// the source has to start it. Hoisting it leaves a `###` leading each
+/// column, which is what lines the two of them up. Only the outranking
+/// heading moves; anything below it is that column's own.
+///
+/// Returns `(header, left, right)`: the hoisted heading (if any) and the
+/// column sources with it removed.
+pub fn split_column_header(left: &str, right: &str) -> (Option<String>, String, String) {
+    let unsplit = || (None, left.to_string(), right.to_string());
+    let hoist_left = || match split_leading_heading(left) {
+        Some((header, rest)) => (Some(header), rest, right.to_string()),
+        None => unsplit(),
+    };
+    let hoist_right = || match split_leading_heading(right) {
+        Some((header, rest)) => (Some(header), left.to_string(), rest),
+        None => unsplit(),
+    };
+    match (leading_heading_level(left), leading_heading_level(right)) {
+        // A heading each, of equal rank: per-column headings, both stay.
+        (Some(l), Some(r)) if l == r => unsplit(),
+        // One outranks the other (`##` over `###`), so it is the slide's.
+        (Some(l), Some(r)) => {
+            if l < r {
+                hoist_left()
+            } else {
+                hoist_right()
+            }
+        }
+        (Some(_), None) => hoist_left(),
+        (None, Some(_)) => hoist_right(),
+        (None, None) => unsplit(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::CodeBlock;
     use super::leading_heading_level as lvl;
+    use super::split_column_header;
 
     fn block(annotation: &str) -> CodeBlock {
         CodeBlock {
@@ -587,5 +708,69 @@ mod tests {
         assert_eq!(lvl("#no-space"), None);
         assert_eq!(lvl("    # indented code"), None); // 4-space indent
         assert_eq!(lvl(""), None);
+    }
+
+    #[test]
+    fn lone_heading_is_hoisted_above_both_columns() {
+        // Left-only heading.
+        let (header, left, right) = split_column_header("## Title\n\nimage\n", "- a\n- b\n");
+        assert_eq!(header.as_deref(), Some("## Title"));
+        assert_eq!(left, "\nimage\n");
+        assert_eq!(right, "- a\n- b\n");
+
+        // Right-only heading, hoisted just the same.
+        let (header, left, right) = split_column_header("image\n", "### Notes\n\n- a\n");
+        assert_eq!(header.as_deref(), Some("### Notes"));
+        assert_eq!(left, "image\n");
+        assert_eq!(right, "\n- a\n");
+    }
+
+    #[test]
+    fn an_outranking_heading_is_the_slide_s() {
+        // The slide's `##` has to start in the left column — that's where the
+        // source begins — but it outranks the `###` opposite, so it belongs
+        // above both. Hoisting it leaves a `###` leading each column, and
+        // those line up.
+        let (header, left, right) = split_column_header(
+            "## if (expr) {} else {}\n\n### Pseudo code\n\ncode\n",
+            "### AArch64 assembly\n\nasm\n",
+        );
+        assert_eq!(header.as_deref(), Some("## if (expr) {} else {}"));
+        assert_eq!(left, "\n### Pseudo code\n\ncode\n");
+        assert_eq!(right, "### AArch64 assembly\n\nasm\n");
+        // Both columns now lead at the same level, so nothing else moves.
+        assert_eq!(lvl(&left), lvl(&right));
+
+        // Same when the senior heading is the one on the right.
+        let (header, left, right) =
+            split_column_header("#### Detail\n\nx\n", "## Slide\n\n#### Other\n");
+        assert_eq!(header.as_deref(), Some("## Slide"));
+        assert_eq!(left, "#### Detail\n\nx\n");
+        assert_eq!(right, "\n#### Other\n");
+
+        // Only the outranking heading moves; the rest is the column's own.
+        assert!(!left.contains("## Slide"));
+    }
+
+    #[test]
+    fn per_column_headings_stay_in_their_columns() {
+        let (header, left, right) = split_column_header("## Before\n\nx\n", "## After\n\ny\n");
+        assert_eq!(header, None);
+        assert_eq!(left, "## Before\n\nx\n");
+        assert_eq!(right, "## After\n\ny\n");
+
+        // Neither side leads with a heading: nothing to hoist.
+        let (header, left, right) = split_column_header("x\n\n## Mid\n", "y\n");
+        assert_eq!(header, None);
+        assert_eq!(left, "x\n\n## Mid\n");
+        assert_eq!(right, "y\n");
+    }
+
+    #[test]
+    fn hoisting_a_heading_only_column_leaves_it_empty() {
+        let (header, left, right) = split_column_header("## Just a heading", "body\n");
+        assert_eq!(header.as_deref(), Some("## Just a heading"));
+        assert_eq!(left, "");
+        assert_eq!(right, "body\n");
     }
 }

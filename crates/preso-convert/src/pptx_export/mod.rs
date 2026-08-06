@@ -15,7 +15,7 @@ pub(crate) mod blocks;
 mod xml;
 
 use anyhow::Context as _;
-use blocks::{Block, Run};
+use blocks::{Block, Run, parse_inlines};
 use std::io::Write as _;
 use std::path::Path;
 
@@ -457,7 +457,188 @@ fn emit_block(
             }
             None => 0,
         },
+        Block::ImageText { index, list } => match slide.image_texts.get(*index) {
+            Some(run) => emit_image_text(ctx, build, slide, n, run, *list, x, y, w),
+            None => 0,
+        },
     }
+}
+
+/// Image-with-text rows: the picture and the text that sat either side of it
+/// on one line, side by side and vertically centred, as the live renderer
+/// draws them. A run that came from a list item keeps its bullet, on the
+/// text beside the picture.
+///
+/// Each row is its own pair of shapes rather than one text frame, since
+/// PowerPoint positions everything absolutely — which is also why an image
+/// that won't embed leaves the text in place rather than losing the row.
+#[allow(clippy::too_many_arguments)]
+fn emit_image_text(
+    ctx: &mut Ctx,
+    build: &mut Build,
+    slide: &preso_core::Slide,
+    n: usize,
+    run: &preso_core::ImageTextRun,
+    list: Option<(u8, bool)>,
+    x: i64,
+    y: i64,
+    w: i64,
+) -> i64 {
+    // A lifted item is its own shape, so PowerPoint numbers it as a list of
+    // one — the items after it start over at 1.
+    if list.is_some_and(|(_, ordered)| ordered) {
+        ctx.warnings.push(format!(
+            "slide {n}: a numbered item holding an image is exported as its own \
+             shape, so the numbering after it restarts"
+        ));
+    }
+    // Embed the pictures first, so their placed widths are known before any
+    // row is laid out: with the image leading every row, they share a column
+    // as wide as the widest, which is what lines the labels up on screen.
+    let mut loaded = Vec::with_capacity(run.lines.len());
+    for line in &run.lines {
+        let (path, width_pct, _, _) = image_target(&line.image.url);
+        let placed = load_image(ctx, path);
+        let pic_w = placed.map_or(0, |(_, _, px_w, px_h)| {
+            placed_rect(px_w, px_h, width_pct, x, y, w, false).2
+        });
+        loaded.push((placed, pic_w));
+    }
+    let column_w = if run.lines.iter().all(|l| l.before.is_empty()) {
+        loaded.iter().map(|(_, pic_w)| *pic_w).max().unwrap_or(0)
+    } else {
+        0
+    };
+
+    let mut total = 0;
+    for (line, (placed, _)) in run.lines.iter().zip(loaded) {
+        let (path, width_pct, _, highlight) = image_target(&line.image.url);
+        let row_y = y + total;
+        let Some((media_n, ext, px_w, px_h)) = placed else {
+            // No picture, but the text is still content: emit it alone so the
+            // slide doesn't quietly lose it.
+            ctx.warnings
+                .push(format!("image {path:?} not embeddable; alt text used"));
+            let text = [line.before.as_str(), &line.image.alt, line.after.as_str()]
+                .iter()
+                .filter(|s| !s.is_empty())
+                .copied()
+                .collect::<Vec<_>>()
+                .join(" ");
+            total += emit_image_text_side(build, &text, list, BODY_PT, x, row_y, w);
+            continue;
+        };
+
+        // The picture first: its placed size sets the row's height and tells
+        // the text how much width is left. `w` stays the base a `{width=NN%}`
+        // is a percentage *of*, so the picture is measured once, not twice.
+        let (_, _, pic_w, pic_h) = placed_rect(px_w, px_h, width_pct, x, row_y, w, false);
+        // The picture draws at its own size but occupies the shared column,
+        // so a narrow icon still hands the label the same left edge.
+        let pic_col = column_w.max(pic_w);
+        let before_runs = parse_inlines(&line.before);
+        let after_runs = parse_inlines(&line.after);
+        let sides = i64::from(!line.before.is_empty()) + i64::from(!line.after.is_empty());
+        let mut spare = (w - pic_col - GAP * sides).max(w / 8);
+        // Text before the picture takes only the room it needs, so the
+        // picture follows the words rather than sitting off at the margin.
+        let before_w = if line.before.is_empty() {
+            0
+        } else {
+            text_width(&before_runs, BODY_PT).clamp(w / 8, spare)
+        };
+        spare -= before_w;
+        // Whatever is left goes to the text after it, which flows on.
+        let after_w = if line.after.is_empty() { 0 } else { spare };
+        let before_h = if line.before.is_empty() {
+            0
+        } else {
+            text_height(&before_runs, BODY_PT, before_w, 0)
+        };
+        let after_h = if line.after.is_empty() {
+            0
+        } else {
+            text_height(&after_runs, BODY_PT, after_w, 0)
+        };
+        let row_h = pic_h.max(before_h).max(after_h);
+
+        // Left to right, each part centred against the row. The bullet goes
+        // on whichever text comes first — two would read as two items.
+        let mut cursor = x;
+        if !line.before.is_empty() {
+            emit_image_text_side(
+                build,
+                &line.before,
+                list,
+                BODY_PT,
+                cursor,
+                row_y + (row_h - before_h) / 2,
+                before_w,
+            );
+            cursor += before_w + GAP;
+        }
+        emit_image(
+            ctx,
+            build,
+            slide,
+            n,
+            media_n,
+            ext,
+            px_w,
+            px_h,
+            width_pct,
+            cursor,
+            row_y + (row_h - pic_h) / 2,
+            w,
+            false,
+            highlight,
+        );
+        cursor += pic_col + GAP;
+        if !line.after.is_empty() {
+            let bullet = line.before.is_empty().then_some(list).flatten();
+            emit_image_text_side(
+                build,
+                &line.after,
+                bullet,
+                BODY_PT,
+                cursor,
+                row_y + (row_h - after_h) / 2,
+                after_w,
+            );
+        }
+        total += row_h + GAP;
+    }
+    total.saturating_sub(GAP).max(0)
+}
+
+/// One text shape beside an image-text row's picture, bulleted when the row
+/// came from a list item. Returns its height.
+fn emit_image_text_side(
+    build: &mut Build,
+    text: &str,
+    list: Option<(u8, bool)>,
+    pt: f32,
+    x: i64,
+    y: i64,
+    w: i64,
+) -> i64 {
+    let runs = parse_inlines(text);
+    let ppr = list.map(|(level, ordered)| xml::list_ppr(level, ordered));
+    let indent = list.map_or(0, |(level, _)| i64::from(level) * 342_900);
+    let para = paragraph(build, &runs, pt, ppr);
+    let h = text_height(&runs, pt, w, indent);
+    let id = build.id();
+    build
+        .shapes
+        .push_str(&xml::text_shape(id, "Image text", (x, y, w, h), &para));
+    h
+}
+
+/// Rough natural width of `runs` set on one line at `pt` — the same average
+/// glyph width [`text_height`] wraps by, so the two agree about how text fits.
+fn text_width(runs: &[Run], pt: f32) -> i64 {
+    let chars: usize = runs.iter().map(|r| r.text.chars().count()).sum();
+    (chars as f64 * f64::from(pt) * 0.48 * EMU_PER_PT) as i64
 }
 
 /// Height of one paragraph of `runs` at `pt`, wrapped to `w` minus `indent`.

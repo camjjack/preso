@@ -42,16 +42,16 @@ fn main() {
 ---
 
 <!-- layout: TwoColumn -->
-<!-- note: One column has a heading, the other doesn't — the bodies still line up under a shared header band. (A slide-level ## title would become the left column's heading, so two-column slides skip it.) -->
+<!-- note: Only one column has a heading, so it spans the whole slide and both bodies start underneath it. Give the other column a heading too and they'd stay per-column instead. -->
 
-## The Problem
+## The Problem, and why a native binary answers it
 
 Browser-based tools are heavy. A blank Slidev deck uses ~400 MB of RAM.
 
 ***
 
 A native binary does the same job in a fraction of the footprint — and
-this prose lines up with the left body, not the heading above it.
+this prose starts level with the left body, both under the heading.
 
 ---
 

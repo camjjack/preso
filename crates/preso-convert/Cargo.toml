@@ -26,3 +26,9 @@ anyhow = { workspace = true }
 # tree via resvg).
 zip = { workspace = true }
 roxmltree = "0.20"
+
+[dev-dependencies]
+# The importer's escaping decisions are checked against the parser preso
+# renders with rather than against a reading of the spec: iced's markdown
+# widget is pulldown-cmark, and this is the version it pulls in.
+pulldown-cmark = { version = "0.12", default-features = false }
