@@ -205,7 +205,7 @@ fn encode_image(page: &Page, quality: f32) -> (Vec<u8>, &'static str) {
 /// Drop the (opaque) alpha channel: PDF DeviceRGB images are 3 bytes/pixel.
 pub(crate) fn rgba_to_rgb(rgba: &[u8]) -> Vec<u8> {
     let mut rgb = Vec::with_capacity(rgba.len() / 4 * 3);
-    for px in rgba.chunks_exact(4) {
+    for px in rgba.as_chunks::<4>().0 {
         rgb.extend_from_slice(&px[..3]);
     }
     rgb
@@ -333,8 +333,10 @@ mod tests {
         // UTF-16BE with BOM, decoding back to the original title.
         assert_eq!(bytes[..2], [0xfe, 0xff]);
         let units: Vec<u16> = bytes[2..]
-            .chunks_exact(2)
-            .map(|c| u16::from_be_bytes([c[0], c[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&pair| u16::from_be_bytes(pair))
             .collect();
         assert_eq!(String::from_utf16(&units).unwrap(), title);
 

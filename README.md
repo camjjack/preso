@@ -17,7 +17,8 @@ machines where the GPU backend misbehaves.
 
 - **Plain-markdown decks** — slides separated by `---`, with YAML frontmatter.
 - **Dual-window presenting** — audience window + presenter view (current slide,
-  next step/slide preview, speaker notes, elapsed + countdown timer).
+  next step/slide preview, speaker notes, elapsed + countdown timer), with a
+  notes-first layout for talks that lean on their notes.
 - **Themes** — TOML themes (two built in: `dark`, `light`) controlling colours,
   fonts, gradients, accent bars, logos, background images, and slide numbers.
 - **Slide kinds** — `title` / `section` / normal slides, each themable

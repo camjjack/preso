@@ -66,5 +66,9 @@ first `<!-- pause -->`, so `note[1]` shows after the first pause):
 <!-- note[1]: Now mention the native rendering. -->
 ```
 
+Once the talk moves past a step, the presenter view dims that step's note, so
+the one for the step on screen stands out. Notes without a step number stay
+at full strength throughout.
+
 Notes and `pause` markers are stripped from the rendered slide; they never show
 on the audience window.

@@ -36,6 +36,7 @@ wide settings. All fields are optional:
 | `theme` | A built-in theme (`dark`, `light`) or a path to a `.toml` theme. See [Theme Basics](../theming/basics.md). |
 | `transition` | Slide transition: `fade` (cross-dissolve), `wipe` (directional reveal), or `none`. `dissolve` is an alias of `fade`; `slide`/`push`/`cover` map to `wipe`. See [Rendering Notes](../appendix/rendering.md#transitions). |
 | `aspect` | Slide aspect ratio, e.g. `"16:9"` or `"4:3"`. |
+| `presenter` | Presenter-view layout: `slide` (the default) or `notes` for large speaker notes. See [Presenter layouts](../getting-started/presenting.md#presenter-layouts). |
 
 Unknown keys are ignored, so a deck written for another tool still loads.
 

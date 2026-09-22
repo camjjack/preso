@@ -36,6 +36,7 @@ slide and the grid follows.
 |-----|--------|
 | <kbd>f</kbd> | Toggle fullscreen for the focused window |
 | <kbd>r</kbd> | Reset the talk timer |
+| <kbd>n</kbd> | Switch the [presenter layout](../getting-started/presenting.md#presenter-layouts) (slide-first ↔ notes-first) |
 | <kbd>v</kbd> | Play the current slide's [video](../writing/video.md): toggle inline play/pause (same as <kbd>Space</kbd> on a video slide), or launch an external player |
 
 ## Annotation

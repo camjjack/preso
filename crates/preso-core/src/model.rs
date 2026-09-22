@@ -10,6 +10,29 @@ pub struct Frontmatter {
     pub theme: Option<String>,
     pub transition: Option<String>,
     pub aspect: Option<String>,
+    /// Presenter-window layout (`slide` | `notes`). Parsed verbatim; the app
+    /// maps it to a layout. Slidev uses the same key for a boolean
+    /// (`presenter: false`), so a non-string value is ignored rather than
+    /// failing the whole deck.
+    #[serde(default, deserialize_with = "string_or_ignore")]
+    pub presenter: Option<String>,
+}
+
+/// A string scalar, or `None` for any other YAML value.
+fn string_or_ignore<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Scalar {
+        Text(String),
+        Other(serde::de::IgnoredAny),
+    }
+    Ok(match Option::<Scalar>::deserialize(deserializer)? {
+        Some(Scalar::Text(text)) => Some(text),
+        Some(Scalar::Other(_)) | None => None,
+    })
 }
 
 /// A speaker note extracted from `<!-- note: ... -->` / `<!-- speaker: ... -->`.

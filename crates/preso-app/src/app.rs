@@ -106,6 +106,8 @@ pub enum Message {
     Key(iced::keyboard::Event),
     /// Overview grid: jump to a slide (0-based) and close the grid.
     OverviewJump(usize),
+    /// Presenter layout label clicked: switch to the next layout (like `N`).
+    CyclePresenterLayout,
     /// Cursor moved over the audience slide area (logical coords).
     PointerMoved(Point),
     PointerPressed,
@@ -172,6 +174,10 @@ pub struct App {
     /// Presenter overview grid (Esc). Thumbnails parse lazily on first
     /// open and are invalidated by reload.
     overview: bool,
+    /// How the presenter window arranges slide, notes and next preview.
+    /// Seeded from the deck's `presenter:` frontmatter; `N` (or clicking the
+    /// status-line label) switches it for the session.
+    pub presenter_layout: presenter::Layout,
     overview_md: Option<Vec<markdown::Content>>,
     /// Laser pointer / pen annotation state (audience window).
     pub pointer: Pointer,
@@ -392,6 +398,8 @@ impl App {
 
         let iced_theme = render::iced_theme(&theme);
         let media = Media::new(&path);
+        let presenter_layout =
+            presenter::Layout::from_frontmatter(deck.frontmatter.presenter.as_deref());
         let title_theme = theme.title.apply(&theme);
         let section_theme = theme.section.apply(&theme);
         let mut app = Self {
@@ -418,6 +426,7 @@ impl App {
             jump_buffer: String::new(),
             overview: false,
             overview_md: None,
+            presenter_layout,
             pointer: Pointer::default(),
             authoring: false,
             toast: None,
@@ -836,6 +845,10 @@ impl App {
                 self.overview = false;
                 self.navigate(Nav::Goto(index))
             }
+            Message::CyclePresenterLayout => {
+                self.presenter_layout = self.presenter_layout.next();
+                Task::none()
+            }
             Message::PointerMoved(position) => {
                 self.pointer.moved(position);
                 Task::none()
@@ -1096,6 +1109,8 @@ impl App {
         match deck {
             Ok(deck) => {
                 tracing::info!(file = %path.display(), slides = deck.len(), "opened deck");
+                self.presenter_layout =
+                    presenter::Layout::from_frontmatter(deck.frontmatter.presenter.as_deref());
                 self.deck = deck;
                 self.media.set_deck_path(&path);
                 self.path = path;
@@ -1169,7 +1184,17 @@ impl App {
         // When a transition is running, the end-of-transition tick requests the
         // capture instead.
         self.pending_capture = self.transition.is_none();
-        self.overview_scroll_task()
+        if self.deck.current_index() != before.0 {
+            // A new slide's notes start at the top, not wherever the last
+            // slide's were scrolled to. (A reveal step keeps the position:
+            // its note joins the ones already on screen.)
+            Task::batch([
+                self.overview_scroll_task(),
+                presenter::scroll_notes_to_top(),
+            ])
+        } else {
+            self.overview_scroll_task()
+        }
     }
 
     /// Mutate the deck for a navigation. (The talk timer runs from launch, so
@@ -1458,6 +1483,10 @@ impl App {
                 self.play_current_video();
                 Task::none()
             }
+            keyboard::Action::CyclePresenterLayout => {
+                self.presenter_layout = self.presenter_layout.next();
+                Task::none()
+            }
             keyboard::Action::OverviewTop => iced::widget::operation::snap_to(
                 OVERVIEW_SCROLL_ID,
                 iced::widget::scrollable::RelativeOffset { x: 0.0, y: 0.0 },
@@ -1548,9 +1577,17 @@ impl App {
                 return;
             }
         };
+        let presenter_before = self.deck.frontmatter.presenter.clone();
         match self.deck.reload(&source) {
             Ok(()) => {
                 tracing::info!(slides = self.deck.len(), "deck reloaded");
+                // Re-apply the deck's layout only when its `presenter:` line
+                // changed, so an `N` switch survives unrelated edits.
+                if self.deck.frontmatter.presenter != presenter_before {
+                    self.presenter_layout = presenter::Layout::from_frontmatter(
+                        self.deck.frontmatter.presenter.as_deref(),
+                    );
+                }
                 self.error = None;
                 self.overview_md = None;
                 self.overview_cols = None;
@@ -1674,6 +1711,21 @@ mod tests {
         }
     }
 
+    /// An `n` key-press event (switch presenter layout).
+    fn n_key_event() -> iced::keyboard::Event {
+        use iced::keyboard::key::{Code, Physical};
+        use iced::keyboard::{Event, Key, Location, Modifiers};
+        Event::KeyPressed {
+            key: Key::Character("n".into()),
+            modified_key: Key::Character("n".into()),
+            physical_key: Physical::Code(Code::KeyN),
+            location: Location::Standard,
+            modifiers: Modifiers::default(),
+            text: Some("n".into()),
+            repeat: false,
+        }
+    }
+
     #[test]
     fn overview_scroll_offset_biases_to_before() {
         // 20 slides, 4 columns → 5 rows (0..=4).
@@ -1714,7 +1766,10 @@ mod tests {
     fn views_build_for_example_talk() {
         let mut app = app(include_str!("../../../docs/example-talk.md"));
         for _ in 0..40 {
-            let _ = presenter::view(&app, window::Id::unique());
+            for layout in [presenter::Layout::Slide, presenter::Layout::Notes] {
+                app.presenter_layout = layout;
+                let _ = presenter::view(&app, window::Id::unique());
+            }
             let _ = audience::view(&app, window::Id::unique());
             app.deck.next();
             app.refresh_markdown();
@@ -1899,6 +1954,62 @@ mod tests {
         app.open_file(dir.join("missing.md"));
         assert_eq!(app.deck.len(), 2);
         assert!(app.error.is_some());
+    }
+
+    #[test]
+    fn presenter_layout_follows_the_deck_and_the_n_key() {
+        assert_eq!(app("# x\n").presenter_layout, presenter::Layout::Slide);
+        let mut app = app("---\npresenter: notes\n---\n# x\n");
+        assert_eq!(app.presenter_layout, presenter::Layout::Notes);
+        let _ = app.update(Message::Key(n_key_event()));
+        assert_eq!(app.presenter_layout, presenter::Layout::Slide);
+        // Clicking the status-line label does the same.
+        let _ = app.update(Message::CyclePresenterLayout);
+        assert_eq!(app.presenter_layout, presenter::Layout::Notes);
+    }
+
+    #[test]
+    fn changing_slide_resets_the_notes_scroll() {
+        // The reset is a widget operation, the only task a navigation returns
+        // with the overview closed, so its presence shows in the task's units.
+        let mut app = app("# A\n\n- one\n<!-- pause -->\n- two\n\n---\n\n# B\n");
+        // A reveal step keeps the notes where they are…
+        assert_eq!(app.navigate(Nav::Next).units(), 0);
+        // …a new slide, either way, starts them at the top.
+        assert_eq!(app.navigate(Nav::Next).units(), 1);
+        assert_eq!(app.navigate(Nav::Prev).units(), 1);
+    }
+
+    #[test]
+    fn a_layout_switch_survives_reloads_until_the_deck_changes_it() {
+        let dir = std::env::temp_dir().join(format!("preso-layout-reload-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("deck.md");
+        std::fs::write(&path, "---\npresenter: notes\n---\n# One\n").unwrap();
+        let (mut app, _task) = App::new(
+            path.clone(),
+            std::fs::read_to_string(&path).unwrap(),
+            preso_style::Theme::default(),
+            None,
+            false,
+            None,
+            false,
+        );
+        let _ = app.update(Message::Key(n_key_event()));
+        assert_eq!(app.presenter_layout, presenter::Layout::Slide);
+
+        // An unrelated edit keeps the presenter's choice…
+        std::fs::write(&path, "---\npresenter: notes\n---\n# One, edited\n").unwrap();
+        app.reload();
+        assert_eq!(app.presenter_layout, presenter::Layout::Slide);
+
+        // …but editing the deck's `presenter:` line applies the new value
+        // over it.
+        let _ = app.update(Message::Key(n_key_event()));
+        assert_eq!(app.presenter_layout, presenter::Layout::Notes);
+        std::fs::write(&path, "---\npresenter: slide\n---\n# One\n").unwrap();
+        app.reload();
+        assert_eq!(app.presenter_layout, presenter::Layout::Slide);
     }
 
     #[test]

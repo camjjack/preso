@@ -8,7 +8,7 @@ their own line; they're invisible in other markdown viewers.
 | Syntax | Meaning |
 |--------|---------|
 | `---` | Slide separator (own line, outside code fences). |
-| frontmatter | First `---`…`---` block: `title`, `theme`, `transition`, `aspect`. |
+| frontmatter | First `---`…`---` block: `title`, `theme`, `transition`, `aspect`, `presenter`. |
 | `<!-- include: path.md -->` | Splice in another markdown file ([split a deck across files](../writing/structure.md#splitting-a-deck-across-files)). |
 
 ## Per-slide

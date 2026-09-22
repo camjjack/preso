@@ -1314,6 +1314,16 @@ mod tests {
     }
 
     #[test]
+    fn frontmatter_presenter_layout_parsed() {
+        let deck = parse("---\npresenter: notes\n---\n# S\n").unwrap();
+        assert_eq!(deck.frontmatter.presenter.as_deref(), Some("notes"));
+        // Slidev's boolean `presenter:` is ignored, not a parse error.
+        let slidev = parse("---\ntitle: x\npresenter: false\n---\n# S\n").unwrap();
+        assert_eq!(slidev.frontmatter.presenter, None);
+        assert_eq!(slidev.frontmatter.title.as_deref(), Some("x"));
+    }
+
+    #[test]
     fn frontmatter_unknown_keys_ignored() {
         let src = "---\ntitle: x\nslidev_specific: whatever\n---\n# S\n";
         let deck = parse(src).unwrap();
