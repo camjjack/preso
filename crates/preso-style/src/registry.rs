@@ -38,9 +38,34 @@ pub fn load(name_or_path: &str) -> Result<Theme, ThemeError> {
 /// Resolve a theme, also checking `<dir>/<name>.toml` for each search
 /// directory (e.g. the user's `…/preso/themes/`). Precedence:
 /// built-in name → search dirs → literal file path.
+///
+/// A relative path is taken from the current directory: right for a
+/// `--theme` typed on the command line. A deck's frontmatter `theme:` wants
+/// [`load_for_deck`].
 pub fn load_with_search(
     name_or_path: &str,
     search_dirs: &[std::path::PathBuf],
+) -> Result<Theme, ThemeError> {
+    load_resolved(name_or_path, search_dirs, None)
+}
+
+/// [`load_with_search`] for a theme named in a deck's frontmatter: a
+/// relative path is found next to the deck (in `deck_dir`), wherever preso
+/// was started, as the deck's images and includes are. The current
+/// directory is still tried after it, for decks written when that was the
+/// only place looked.
+pub fn load_for_deck(
+    name_or_path: &str,
+    search_dirs: &[std::path::PathBuf],
+    deck_dir: &Path,
+) -> Result<Theme, ThemeError> {
+    load_resolved(name_or_path, search_dirs, Some(deck_dir))
+}
+
+fn load_resolved(
+    name_or_path: &str,
+    search_dirs: &[std::path::PathBuf],
+    deck_dir: Option<&Path>,
 ) -> Result<Theme, ThemeError> {
     if let Some(theme) = builtin(name_or_path) {
         return Ok(theme);
@@ -90,6 +115,12 @@ pub fn load_with_search(
         }
     }
     let path = Path::new(name_or_path);
+    if let Some(dir) = deck_dir.filter(|_| path.is_relative()) {
+        let beside = dir.join(path);
+        if beside.is_file() {
+            return read(&beside);
+        }
+    }
     if path.is_file() {
         return read(path);
     }
@@ -122,6 +153,36 @@ mod tests {
             load("no-such-theme"),
             Err(ThemeError::NotFound(_))
         ));
+    }
+
+    #[test]
+    fn a_deck_finds_its_theme_beside_it() {
+        let dir = std::env::temp_dir().join(format!("preso-theme-beside-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("themes")).unwrap();
+        let toml = DARK.replacen("name = \"dark\"", "name = \"beside\"", 1);
+        std::fs::write(dir.join("themes/house.toml"), toml).unwrap();
+
+        // Relative to the deck, whatever the current directory is (the test
+        // runs from the crate, where there's no `themes/house.toml`).
+        let theme = load_for_deck("themes/house.toml", &[], &dir).unwrap();
+        assert_eq!(theme.name, "beside");
+        // Its own asset paths still resolve against the theme file.
+        assert_eq!(
+            theme.source_dir.as_deref(),
+            Some(dir.join("themes").as_path())
+        );
+        // A command-line path is still taken from the current directory.
+        assert!(load_with_search("themes/house.toml", &[]).is_err());
+        // Built-ins and absolute paths are unaffected.
+        assert_eq!(load_for_deck("light", &[], &dir).unwrap().name, "light");
+        let absolute = dir.join("themes/house.toml").display().to_string();
+        assert_eq!(
+            load_for_deck(&absolute, &[], Path::new("/nonexistent"))
+                .unwrap()
+                .name,
+            "beside"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

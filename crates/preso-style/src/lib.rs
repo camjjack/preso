@@ -13,4 +13,4 @@ pub use model::{
     Palette, PaletteOverlay, QuoteStyle, ShadowSetting, Side, SlideNumber, SlideStyle,
     SlideStyleOverlay, Spacing, SpacingOverlay, TableStyle, Theme, ThemeOverlay, VerticalAlign,
 };
-pub use registry::{ThemeError, load, load_with_search};
+pub use registry::{ThemeError, load, load_for_deck, load_with_search};

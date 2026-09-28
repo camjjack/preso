@@ -375,6 +375,10 @@ pub struct SlideContext<'a> {
     /// `preso-hl-draw:` URI (see `HighlightAuthor`). Only ever set for the
     /// presenter's *current* slide, which renders interactively.
     pub authoring: bool,
+    /// The reveal step the zoom camera is easing away from, and how far it
+    /// has come (eased, 0→1). Set only on the audience window while a step
+    /// animates; `None` shows every zoom at rest.
+    pub zoom_from: Option<(usize, f32)>,
 }
 
 /// Resolve a slide's horizontal alignment: a per-slide `halign=` override
@@ -430,6 +434,23 @@ struct PresoViewer<'a> {
 }
 
 impl<'a> PresoViewer<'a> {
+    /// Wrap a zoomable block in the camera, focused per `focus_at(stage)`
+    /// for the stage the reveal step selects — easing in from the previous
+    /// step's stage while the audience window animates one.
+    fn zoomed(
+        &self,
+        content: impl Into<Element<'a, markdown::Uri>>,
+        block: &preso_core::CodeBlock,
+        focus_at: impl Fn(usize) -> crate::zoom::Focus,
+    ) -> crate::zoom::Zoom<'a, markdown::Uri> {
+        let stage_at = |step| code_stage(block.stage_count(), step, self.ctx.code_stage);
+        let camera = crate::zoom::zoom(content, focus_at(stage_at(self.ctx.step)));
+        match self.ctx.zoom_from {
+            Some((from_step, t)) => camera.from(focus_at(stage_at(from_step)), t),
+            None => camera,
+        }
+    }
+
     /// Render a GFM table with the theme's `[table]` styling: header fill,
     /// per-column alignment, zebra striping, and row separators. preso draws
     /// tables itself because iced's markdown table can't be themed (cells are
@@ -1273,21 +1294,45 @@ impl<'a> markdown::Viewer<'a, markdown::Uri> for PresoViewer<'a> {
             .and_then(preso_core::CodeBlock::width_percent)
             .map(|pct| self.ctx.content_width() * pct / 100.0);
         let transparent = block.is_some_and(preso_core::CodeBlock::transparent_background);
-        let diagram = match language {
+        // A `zoom` diagram's stages name the nodes to zoom onto. It keeps
+        // rasters at a few depths, so a node blown up to fill the slide is
+        // still sharp (see `zoom::by_depth`).
+        let zooms = block.is_some_and(preso_core::CodeBlock::zooms);
+        let raster = |depth: f32| match language {
             Some("mermaid") => {
                 self.ctx
                     .media
-                    .mermaid(code, self.ctx.scale, target_width, transparent)
+                    .mermaid(code, self.ctx.scale, target_width, transparent, depth)
             }
-            Some("dot" | "graphviz") => self.ctx.media.graphviz(code, self.ctx.scale, target_width),
+            Some("dot" | "graphviz") => {
+                self.ctx
+                    .media
+                    .graphviz(code, self.ctx.scale, target_width, depth)
+            }
             _ => None,
         };
-        if let Some((handle, size)) = diagram {
-            let img = iced::widget::image(handle)
-                .width(size.width)
-                .height(size.height);
+        if let Some((handle, size)) = raster(1.0) {
+            let picture = |handle| {
+                iced::widget::image(handle)
+                    .width(size.width)
+                    .height(size.height)
+            };
+            let img: Element<'a, markdown::Uri> = if zooms {
+                let level = |depth, handle: iced::widget::image::Handle| crate::zoom::Level {
+                    depth,
+                    shown: picture(handle.clone()).into(),
+                    warm: picture(handle).opacity(0.0_f32).into(),
+                };
+                let deeper = ZOOM_DEPTHS
+                    .iter()
+                    .filter_map(|&d| raster(d).map(|(h, _)| level(d, h)));
+                crate::zoom::by_depth(std::iter::once(level(1.0, handle)).chain(deeper).collect())
+                    .into()
+            } else {
+                picture(handle).into()
+            };
             let framed: Element<'a, markdown::Uri> = if transparent {
-                img.into()
+                img
             } else {
                 container(img)
                     .padding(12.0 * self.ctx.scale)
@@ -1297,6 +1342,27 @@ impl<'a> markdown::Viewer<'a, markdown::Uri> for PresoViewer<'a> {
                         ..container::Style::default()
                     })
                     .into()
+            };
+            // The card zooms along with the diagram; the labels' region is
+            // relative to the image inside it.
+            let framed: Element<'a, markdown::Uri> = match block.filter(|_| zooms) {
+                Some(b) => self
+                    .zoomed(framed, b, |stage| {
+                        b.zoom_labels_at(stage)
+                            .and_then(|labels| {
+                                self.ctx
+                                    .media
+                                    .diagram_region(language?, code, transparent, &labels)
+                            })
+                            .map_or(crate::zoom::Focus::Whole, |rect| {
+                                crate::zoom::Focus::Region {
+                                    rect,
+                                    depth: usize::from(!transparent),
+                                }
+                            })
+                    })
+                    .into(),
+                None => framed,
             };
             return container(framed)
                 .padding(padding::top(settings.spacing.0).bottom(settings.spacing.0))
@@ -1454,6 +1520,27 @@ impl<'a> markdown::Viewer<'a, markdown::Uri> for PresoViewer<'a> {
         // `{align=center|right}` centres/right-aligns the panel within the
         // content width; the default (left) keeps it where it sits.
         use iced::alignment::Horizontal;
+        let align = match code_block.and_then(preso_core::CodeBlock::align) {
+            Some("center") => Horizontal::Center,
+            Some("right") => Horizontal::Right,
+            _ => Horizontal::Left,
+        };
+        // `{… zoom}`: the stages zoom onto their lines as well, the panel
+        // growing into the room below it.
+        if let Some(b) = code_block.filter(|b| b.zooms()) {
+            return self
+                .zoomed(panel, b, |stage| match b.zoom_lines_at(stage) {
+                    Some((first, last)) => crate::zoom::Focus::Rows {
+                        first: first.saturating_sub(1),
+                        last: last.saturating_sub(1),
+                        // Inside the panel's padding.
+                        depth: 1,
+                    },
+                    None => crate::zoom::Focus::Whole,
+                })
+                .align_x(align)
+                .into();
+        }
         match code_block.and_then(preso_core::CodeBlock::align) {
             Some("center") => container(panel)
                 .width(Fill)
@@ -2035,6 +2122,11 @@ fn framed_image<'a, M: 'a>(
         .into()
 }
 
+/// Raster depths a zoomable diagram keeps beyond its plain 1× raster: each
+/// at most twice the one before, so whichever is drawn is never shrunk by
+/// more than 2× (and aliased). The deepest matches `zoom::MAX_ZOOM`.
+const ZOOM_DEPTHS: [f32; 2] = [2.0, 4.0];
+
 /// Per-call options for [`slide_surface`].
 pub struct SurfaceOptions {
     /// Design-space → logical-pixel scale.
@@ -2060,6 +2152,51 @@ pub struct SurfaceOptions {
     /// dither noise defeats JPEG compression (~14x larger pages), and
     /// iced's plain gradient is what exports always shipped.
     pub dither: bool,
+    /// The slide zoom (`<!-- zoom[n]: … -->`) to show the content through.
+    pub zoom: SurfaceZoom,
+}
+
+/// A slide zoom for [`slide_surface`]: where it looks at this step, and —
+/// while the audience window eases a step in — where it looked at the step
+/// just left and how far it has come (eased, 0→1).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SurfaceZoom {
+    pub to: Option<preso_core::ZoomFocus>,
+    pub from: Option<(Option<preso_core::ZoomFocus>, f32)>,
+}
+
+impl SurfaceZoom {
+    /// `slide`'s zoom at `step`, at rest.
+    pub fn at(slide: &preso_core::Slide, step: usize) -> Self {
+        Self {
+            to: slide.zoom_at(step),
+            from: None,
+        }
+    }
+
+    /// `slide`'s zoom at `step`, easing from the step in `from` (see
+    /// `App::step_zoom_from`) when there is one.
+    pub fn easing(slide: &preso_core::Slide, step: usize, from: Option<(usize, f32)>) -> Self {
+        Self {
+            to: slide.zoom_at(step),
+            from: from.map(|(from_step, t)| (slide.zoom_at(from_step), t)),
+        }
+    }
+
+    fn is_whole(&self) -> bool {
+        self.to.is_none() && self.from.is_none_or(|(from, _)| from.is_none())
+    }
+}
+
+fn zoom_focus(focus: Option<preso_core::ZoomFocus>) -> crate::zoom::Focus {
+    match focus {
+        Some(f) => crate::zoom::Focus::Camera(crate::zoom::Camera {
+            x: f.x,
+            y: f.y,
+            scale: f.scale,
+        }),
+        None => crate::zoom::Focus::Whole,
+    }
 }
 
 /// The full slide visual: themed background (solid or gradient), optional
@@ -2072,8 +2209,149 @@ pub fn slide_surface<'a>(
     overrides: &preso_core::SlideOverrides,
     options: SurfaceOptions,
 ) -> Element<'a, Message> {
+    surface_layers(body, media, theme, overrides, options).into_element()
+}
+
+/// A slide surface split into what the slide *says* and the design it sits
+/// on, so the content-wipe transition can move one and hold the other still.
+pub struct SurfaceLayers<'a> {
+    size: iced::Size,
+    background: Element<'a, Message>,
+    /// Layer images, the body, and the video badge.
+    content: Vec<Element<'a, Message>>,
+    /// Accent bars, logo, and slide number.
+    chrome: Vec<Element<'a, Message>>,
+    /// Drawn above the chrome, but it's per-slide text, so it wipes.
+    footnote: Option<Element<'a, Message>>,
+}
+
+impl<'a> SurfaceLayers<'a> {
+    /// Stack the layers into the finished surface.
+    pub fn into_element(self) -> Element<'a, Message> {
+        let mut layers = vec![self.background];
+        layers.extend(self.content);
+        layers.extend(self.chrome);
+        layers.extend(self.footnote);
+        container(iced::widget::stack(layers))
+            .width(self.size.width)
+            .height(self.size.height)
+            .into()
+    }
+}
+
+/// Whether two slides share a design — background, accent bars, logo — so a
+/// content wipe can hold it still between them. The slide number is left out:
+/// it changes on every slide, and the wipe simply shows the incoming one.
+pub fn same_design(
+    a_theme: &preso_style::Theme,
+    a: &preso_core::SlideOverrides,
+    b_theme: &preso_style::Theme,
+    b: &preso_core::SlideOverrides,
+) -> bool {
+    a_theme == b_theme
+        && a.background == b.background
+        && a.background_fit == b.background_fit
+        && a.background_fill == b.background_fill
+}
+
+/// One frame of a content wipe from `outgoing` to `incoming`: the outgoing
+/// slide shows left of `edge` (a fraction of the width), the incoming right
+/// of it. With `shared_design` only the content layers are split — the
+/// background, bars and logo are drawn once and never move. Otherwise the
+/// design itself changes between the slides, so the whole surface wipes.
+pub fn content_wipe<'a>(
+    outgoing: SurfaceLayers<'a>,
+    incoming: SurfaceLayers<'a>,
+    edge: f32,
+    shared_design: bool,
+) -> Element<'a, Message> {
+    use crate::clip::band;
     use iced::widget::stack;
 
+    let size = incoming.size;
+    if !shared_design {
+        // The incoming surface goes underneath whole rather than in a band of
+        // its own, so no seam can open between the two bands.
+        return container(stack![
+            incoming.into_element(),
+            band(outgoing.into_element(), 0.0, edge)
+        ])
+        .width(size.width)
+        .height(size.height)
+        .into();
+    }
+
+    let group = |layers: Vec<Element<'a, Message>>| stack(layers).width(Fill).height(Fill);
+    let mut layers = vec![
+        incoming.background,
+        band(group(outgoing.content), 0.0, edge).into(),
+        band(group(incoming.content), edge, 1.0).into(),
+    ];
+    layers.extend(incoming.chrome);
+    layers.extend(outgoing.footnote.map(|f| band(f, 0.0, edge).into()));
+    layers.extend(incoming.footnote.map(|f| band(f, edge, 1.0).into()));
+    container(stack(layers))
+        .width(size.width)
+        .height(size.height)
+        .into()
+}
+
+/// One frame of a pan from `outgoing` to `incoming`, `t` (0→1) of the way:
+/// the two slides sit side by side on one long strip and the camera glides
+/// along it, so the outgoing content slides off in `direction` as the
+/// incoming slides in behind it from the opposite side. With
+/// `shared_design` only the content moves; the background, bars and logo are
+/// drawn once and never budge. Otherwise the whole slide pans.
+pub fn content_pan<'a>(
+    outgoing: SurfaceLayers<'a>,
+    incoming: SurfaceLayers<'a>,
+    t: f32,
+    direction: crate::transition::Direction,
+    shared_design: bool,
+) -> Element<'a, Message> {
+    use crate::clip::band;
+    use iced::widget::stack;
+
+    let (x, y) = direction.vector();
+    let out_shift = (x * t, y * t);
+    let in_shift = (-x * (1.0 - t), -y * (1.0 - t));
+    let size = incoming.size;
+    let slid = |layer: Element<'a, Message>, (dx, dy): (f32, f32)| -> Element<'a, Message> {
+        band(layer, 0.0, 1.0).shifted(dx, dy).into()
+    };
+    if !shared_design {
+        return container(stack![
+            slid(outgoing.into_element(), out_shift),
+            slid(incoming.into_element(), in_shift)
+        ])
+        .width(size.width)
+        .height(size.height)
+        .into();
+    }
+
+    let group = |layers: Vec<Element<'a, Message>>| stack(layers).width(Fill).height(Fill);
+    let mut layers = vec![
+        incoming.background,
+        slid(group(outgoing.content).into(), out_shift),
+        slid(group(incoming.content).into(), in_shift),
+    ];
+    layers.extend(incoming.chrome);
+    layers.extend(outgoing.footnote.map(|f| slid(f, out_shift)));
+    layers.extend(incoming.footnote.map(|f| slid(f, in_shift)));
+    container(stack(layers))
+        .width(size.width)
+        .height(size.height)
+        .into()
+}
+
+/// [`slide_surface`] before its layers are stacked.
+pub fn surface_layers<'a>(
+    body: Element<'a, Message>,
+    media: &'a Media,
+    theme: &'a preso_style::Theme,
+    overrides: &preso_core::SlideOverrides,
+    options: SurfaceOptions,
+) -> SurfaceLayers<'a> {
     let SurfaceOptions {
         scale,
         size,
@@ -2083,6 +2361,7 @@ pub fn slide_surface<'a>(
         video,
         video_playing,
         dither,
+        zoom,
     } = options;
     let (width, height) = (size.width, size.height);
 
@@ -2112,8 +2391,7 @@ pub fn slide_surface<'a>(
 
     // 1. Background (content renders on top, so a background image doubles
     //    as a "text over photo" slide).
-    let mut layers: Vec<Element<'a, Message>> =
-        vec![background_layer(media, theme, overrides, size, dither)];
+    let background = background_layer(media, theme, overrides, size, dither);
 
     // Space carved out by `reserve` bars: content and positioned layer images
     // both keep clear of it (chrome — bars, logo, number — may still overlap).
@@ -2132,17 +2410,14 @@ pub fn slide_surface<'a>(
     //      background but below the content, so overlapping text stays on
     //      top. They sit inside any reserved-bar area, so `position=right`
     //      clears a reserved right bar.
-    layers.extend(
-        layer_images
-            .iter()
-            .filter_map(|li| layer_image_element(media, li, reserved, width, scale)),
-    );
+    let mut content_layers: Vec<Element<'a, Message>> = layer_images
+        .iter()
+        .filter_map(|li| layer_image_element(media, li, reserved, width, scale))
+        .collect();
 
     // 2. The slide content itself. Per-slide `align=` wins over the theme.
-    //    Content sits directly above the background so the transition veil
-    //    (added next) covers only the things that change between slides;
-    //    the accent bar, logo, and slide number are layered *afterwards*,
-    //    above the veil, so persistent chrome doesn't flash on each change.
+    //    Content sits below the accent bar, logo, and slide number, so the
+    //    content wipe can swap it underneath that persistent chrome.
     // Uniform slide padding plus the reserved-bar insets computed above.
     let sp = theme.spacing.slide_padding * scale;
     let pad = iced::Padding {
@@ -2161,21 +2436,37 @@ pub fn slide_surface<'a>(
         preso_style::VerticalAlign::Top => content,
         preso_style::VerticalAlign::Center => content.align_y(iced::alignment::Vertical::Center),
     };
-    layers.push(content.into());
+    content_layers.push(content.into());
 
     // 2.5. Video affordance: a centered play/pause badge for
     //      `<!-- video: … -->` slides. It sits above the content, so it
     //      dissolves with the slide.
     if video {
-        layers.push(video_badge_layer(scale, video_playing));
+        content_layers.push(video_badge_layer(scale, video_playing));
     }
 
+    // 2.75. A slide zoom magnifies the content — never the background or
+    //       chrome, which hold still around it like the content wipe's.
+    let content_layers = if zoom.is_whole() {
+        content_layers
+    } else {
+        let group = iced::widget::stack(content_layers).width(Fill).height(Fill);
+        let camera = crate::zoom::zoom(group, zoom_focus(zoom.to));
+        let camera = match zoom.from {
+            Some((from, t)) => camera.from(zoom_focus(from), t),
+            None => camera,
+        };
+        vec![camera.into()]
+    };
+
     // 3. (Slide transitions are no longer a veil inside the surface; the
-    //    audience window overlays the captured outgoing frame instead — see
-    //    `transition.rs` and `audience.rs`.)
+    //    audience window overlays the captured outgoing frame, or splits
+    //    these layers for a content wipe — see `transition.rs` and
+    //    `audience.rs`.)
 
     // 4. Accent bars along their edges (`hidden` already filtered out).
-    layers.extend(bars.iter().map(|bar| bar_layer(bar, scale)));
+    let mut chrome: Vec<Element<'a, Message>> =
+        bars.iter().map(|bar| bar_layer(bar, scale)).collect();
 
     // 5. Logo watermark in a corner (`hidden` lets a kind overlay drop it).
     if let Some(logo) = style
@@ -2184,7 +2475,7 @@ pub fn slide_surface<'a>(
         .filter(|l| !l.hidden && !l.path.is_empty())
         && let Some(layer) = logo_layer(media, logo, theme, width, scale)
     {
-        layers.push(layer);
+        chrome.push(layer);
     }
 
     // 6. Slide number stamp, on top so content can't cover it
@@ -2192,18 +2483,22 @@ pub fn slide_surface<'a>(
     if let (Some(number_style), Some(counts)) =
         (theme.slide_number.as_ref().filter(|n| !n.hidden), number)
     {
-        layers.push(number_layer(number_style, theme, counts, scale));
+        chrome.push(number_layer(number_style, theme, counts, scale));
     }
 
     // 7. Footnote (`<!-- footnote: … -->`), styled by `[footnote]`.
     //    `hidden` (via a kind overlay) drops it.
-    if let Some(text_str) = footnote.filter(|s| !s.trim().is_empty())
-        && !theme.footnote.hidden
-    {
-        layers.push(footnote_layer(theme, text_str, scale, reserved));
-    }
+    let footnote = footnote
+        .filter(|s| !s.trim().is_empty() && !theme.footnote.hidden)
+        .map(|text_str| footnote_layer(theme, text_str, scale, reserved));
 
-    container(stack(layers)).width(width).height(height).into()
+    SurfaceLayers {
+        size: iced::Size::new(width, height),
+        background,
+        content: content_layers,
+        chrome,
+        footnote,
+    }
 }
 
 /// Layer 1: the slide background. Precedence: per-slide `background=`
@@ -2554,6 +2849,23 @@ fn background_image_override(overrides: &preso_core::SlideOverrides) -> Option<&
     }
 }
 
+/// Whether a video slide has a picture of its own to stand in for the clip
+/// before it plays: an image, a positioned `<!-- image: … -->`, or a
+/// background image. Without one, the clip's first frame fills in instead.
+/// Display math, which the parser also writes as an image, doesn't count.
+#[cfg_attr(not(feature = "video"), allow(dead_code))]
+pub fn has_poster(slide: &preso_core::Slide) -> bool {
+    if background_image_override(&slide.overrides).is_some() || !slide.layer_images.is_empty() {
+        return true;
+    }
+    let src = &slide.source;
+    src.match_indices("![").any(|(i, _)| {
+        src[i..]
+            .find("](")
+            .is_some_and(|j| !src[i + j + 2..].starts_with("preso-math:"))
+    })
+}
+
 /// Which click-through stage a code block shows: the reveal step, clamped to
 /// the block's last stage, unless [`SlideContext::code_stage`] forces one
 /// (the one-page-per-slide export forces the first).
@@ -2617,6 +2929,155 @@ pub fn slide_inert<'a>(
 mod tests {
     use super::*;
 
+    /// One pan frame between two slides whose content is a solid block of
+    /// `out` / `into`, rendered at a tenth of design size (192×108), as a
+    /// pixel sampler over fractions of the canvas.
+    fn pan_frame(
+        t: f32,
+        direction: crate::transition::Direction,
+        out: Color,
+        into: Color,
+    ) -> impl Fn(f32, f32) -> [u8; 4] {
+        let media = Media::new(std::path::Path::new("deck.md"));
+        let theme = preso_style::Theme::default();
+        let overrides = preso_core::SlideOverrides::default();
+        let layers = |c: Color| {
+            let body: Element<'_, Message> = container(iced::widget::space())
+                .width(Fill)
+                .height(Fill)
+                .style(move |_| container::background(c))
+                .into();
+            surface_layers(
+                body,
+                &media,
+                &theme,
+                &overrides,
+                SurfaceOptions {
+                    scale: 0.1,
+                    size: iced::Size::new(192.0, 108.0),
+                    number: None,
+                    footnote: None,
+                    layer_images: Vec::new(),
+                    video: false,
+                    video_playing: false,
+                    dither: false,
+                    zoom: SurfaceZoom::default(),
+                },
+            )
+        };
+        let element = content_pan(layers(out), layers(into), t, direction, true);
+        crate::export::sampler(crate::export::offscreen(
+            element,
+            iced::Size::new(192.0, 108.0),
+            iced::Settings::default(),
+            &iced::Theme::Dark,
+            0,
+        ))
+    }
+
+    #[test]
+    fn a_pan_slides_the_content_along_over_a_still_background() {
+        let (red, blue) = (
+            Color::from_rgb(1.0, 0.0, 0.0),
+            Color::from_rgb(0.0, 0.0, 1.0),
+        );
+        const RED: [u8; 4] = [255, 0, 0, 255];
+        const BLUE: [u8; 4] = [0, 0, 255, 255];
+        let background = {
+            let c = color(preso_style::Theme::default().colors.background);
+            let [r, g, b, a] = c.into_rgba8();
+            [r, g, b, a]
+        };
+
+        use crate::transition::Direction;
+
+        // Halfway through a leftward pan: the outgoing content has slid half
+        // off to the left, the incoming half in from the right.
+        let pixel = pan_frame(0.5, Direction::Left, red, blue);
+        assert_eq!(pixel(0.25, 0.5), RED);
+        assert_eq!(pixel(0.75, 0.5), BLUE);
+        // The slide padding's strip of background stays where it is.
+        assert_eq!(pixel(0.5, 0.02), background);
+
+        // Rightward, the other way about.
+        let pixel = pan_frame(0.5, Direction::Right, red, blue);
+        assert_eq!(pixel(0.25, 0.5), BLUE);
+        assert_eq!(pixel(0.75, 0.5), RED);
+
+        // Upward: out through the top, in from the bottom.
+        let pixel = pan_frame(0.5, Direction::Up, red, blue);
+        assert_eq!(pixel(0.5, 0.25), RED);
+        assert_eq!(pixel(0.5, 0.75), BLUE);
+        assert_eq!(pixel(0.01, 0.5), background, "the side padding holds still");
+
+        // Downward.
+        let pixel = pan_frame(0.5, Direction::Down, red, blue);
+        assert_eq!(pixel(0.5, 0.25), BLUE);
+        assert_eq!(pixel(0.5, 0.75), RED);
+
+        // Early on, the outgoing slide still fills most of the canvas.
+        let pixel = pan_frame(0.1, Direction::Left, red, blue);
+        assert_eq!(pixel(0.5, 0.5), RED);
+        assert_eq!(pixel(0.97, 0.5), BLUE);
+    }
+
+    #[test]
+    fn a_video_slide_s_own_picture_is_its_poster() {
+        let slide = |src: &str| preso_core::parser::parse(src).unwrap().slides.remove(0);
+        // Nothing to show before the clip plays: its first frame will.
+        assert!(!has_poster(&slide("<!-- video: a.mp4 -->\n")));
+        assert!(!has_poster(&slide("# Demo\n<!-- video: a.mp4 -->\n")));
+        // Display math is written as an image too, but it's no poster.
+        assert!(!has_poster(&slide("<!-- video: a.mp4 -->\n$$ x^2 $$\n")));
+        // A link isn't an image.
+        assert!(!has_poster(&slide("<!-- video: a.mp4 -->\n[see](b.png)\n")));
+        // An image, a positioned image, or a background image is.
+        assert!(has_poster(&slide(
+            "<!-- video: a.mp4 -->\n![still](still.png)\n"
+        )));
+        assert!(has_poster(&slide(
+            "<!-- video: a.mp4 -->\n<!-- image: still.png -->\n"
+        )));
+        assert!(has_poster(&slide(
+            "<!-- slide: background=still.png -->\n<!-- video: a.mp4 -->\n"
+        )));
+        // A background colour isn't.
+        assert!(!has_poster(&slide(
+            "<!-- slide: background=#000000 -->\n<!-- video: a.mp4 -->\n"
+        )));
+    }
+
+    #[test]
+    fn same_design_ignores_content_but_not_backgrounds() {
+        let theme = preso_style::Theme::default();
+        let plain = preso_core::SlideOverrides::default();
+        // Content-only differences (alignment, text size) keep the design.
+        let aligned = preso_core::SlideOverrides {
+            align: Some("center".into()),
+            size: Some(20.0),
+            ..Default::default()
+        };
+        assert!(same_design(&theme, &plain, &theme, &aligned));
+
+        // A per-slide background (and with it, dropped bars) is a new design.
+        let photo = preso_core::SlideOverrides {
+            background: Some("photo.jpg".into()),
+            ..Default::default()
+        };
+        assert!(!same_design(&theme, &plain, &theme, &photo));
+        let contained = preso_core::SlideOverrides {
+            background_fit: Some("contain".into()),
+            ..photo.clone()
+        };
+        assert!(!same_design(&theme, &photo, &theme, &contained));
+
+        // So is a different theme, as a `kind=title` slide resolves to.
+        let mut title = theme.clone();
+        title.slide.logo = None;
+        title.colors.background = preso_style::Color::parse("#123456").unwrap();
+        assert!(!same_design(&theme, &plain, &title, &plain));
+    }
+
     #[test]
     fn background_fit_defaults_to_cover() {
         let fit = |v: Option<&str>| {
@@ -2637,6 +3098,36 @@ mod tests {
 
         assert_eq!(fit(Some("stretch")), iced::ContentFit::Fill);
         assert_eq!(fit(Some("none")), iced::ContentFit::None);
+    }
+
+    #[test]
+    fn language_server_knows_the_built_in_themes() {
+        // preso-lsp treats `lint::BUILTIN_THEMES` as names, anything else as
+        // a theme to find: each must be built in.
+        for name in preso_core::lint::BUILTIN_THEMES {
+            assert!(preso_style::registry::builtin(name).is_some(), "{name}");
+        }
+        assert!(preso_style::registry::builtin("nonesuch").is_none());
+    }
+
+    #[test]
+    fn language_server_knows_every_fit() {
+        // preso-lsp warns on a `fit=` value outside `lint::SLIDE_KEYS`, so
+        // the list must hold exactly the values this renderer acts on.
+        let fit = |v: &str| {
+            background_fit(&preso_core::SlideOverrides {
+                background_fit: Some(v.to_string()),
+                ..Default::default()
+            })
+        };
+        let (_, known) = preso_core::lint::SLIDE_KEYS
+            .iter()
+            .find(|(k, _)| *k == "fit")
+            .unwrap();
+        let fits: std::collections::HashSet<_> =
+            known.iter().map(|v| format!("{:?}", fit(v))).collect();
+        assert_eq!(fits.len(), known.len(), "each listed fit is distinct");
+        assert_eq!(fits.len(), 4, "every fit the renderer has is listed");
     }
 
     #[test]

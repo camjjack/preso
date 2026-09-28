@@ -26,6 +26,33 @@ Widen `width`/`height` on the `<svg>` element to suit (the coordinates don't
 change, so nothing moves or rescales — there's just room now), or convert the
 text to paths when exporting, which removes the font dependency altogether.
 
+### Fonts an SVG names
+
+An SVG sets its text in whatever font it names, and preso can only use fonts
+that are installed (plus the ones it bundles). Where a named font is missing,
+preso substitutes its own sans — and says so:
+
+```text
+WARN preso::media: SVG asks for `Arial` — not installed here, so its text is
+set in a substitute instead…  image="diagram.svg"
+```
+
+This matters most in **CI**, where a runner typically has almost no fonts. A
+file naming `Arial` with no fallback renders fully on a Mac and, without the
+substitution, would render as shapes with no text at all on a Linux runner —
+because an SVG renderer drops text it can't find a font for. preso fills that
+gap, so a deck builds the same everywhere; the labels are just set in a
+different face, and the metrics differ enough that content can overrun the
+canvas (the warning above).
+
+To keep the original face, either install it on the machine doing the
+rendering, or remove the dependency at the source:
+
+- add a generic fallback, `font-family="Arial, sans-serif"`, so the intent is
+  in the file;
+- or export the SVG with its text converted to paths, which pins the exact
+  shapes and needs no font anywhere.
+
 An **animated GIF** plays on the slide, looping. Be aware of what that costs:
 a GIF's frames are stored as deltas but *decode* to the whole canvas, so a
 1920×1018 capture is 7.5 MB a frame however small the file looks — a 70-second

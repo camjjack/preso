@@ -1,0 +1,28 @@
+[package]
+name = "preso-lsp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+description = "Language server for preso decks: slide outline, diagnostics, completions and layout code actions"
+
+[[bin]]
+name = "preso-lsp"
+path = "src/main.rs"
+
+[dependencies]
+preso-core = { workspace = true }
+# Draws diagrams to check and complete their zoom stages' node labels.
+preso-diagram = { workspace = true }
+# The user's theme folder, where a frontmatter `theme:` name is looked up.
+dirs = { workspace = true }
+lsp-server = "0.10"
+lsp-types = "0.97"
+serde_json = "1"
+anyhow = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }

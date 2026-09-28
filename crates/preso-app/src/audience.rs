@@ -17,17 +17,19 @@ pub fn view(app: &App, window: window::Id) -> Element<'_, Message> {
     // overlapping/mis-sized glyphs in BOTH windows).
     let scale = render::quantize_scale(raw);
 
-    // Poster badge: the slide has a clip that isn't currently playing. The
-    // clip is preloaded (paused) on a video slide, so "playing" — not merely
-    // "loaded" — is what hides the badge and shows the video over the slide.
-    let playing = app.video_playing();
-    let show_badge = app.deck.current_slide().video.is_some() && !playing;
+    // The ▶ badge only marks a clip that plays in an external player; an
+    // inline clip is controlled from the presenter's play button and scrub
+    // bar, so the audience just sees its frame (or the slide's own poster
+    // until it plays).
+    let show_badge = app.deck.current_slide().video.is_some() && !app.video_inline();
 
     // The slide canvas: fixed aspect, themed surface (background/gradient,
-    // accent bar, logo) with the content on top. Slide transitions overlay the
-    // outgoing frame on top of this live surface (see the end of this fn).
-    let surface = render::slide_surface(
-        app.current_slide_element(scale, app.window_scale_factor(window), true, false),
+    // accent bar, logo) with the content on top. The screenshot transitions
+    // overlay the outgoing frame on top of this live surface (see the end of
+    // this fn); a content wipe splits the surface's layers instead.
+    let scale_factor = app.window_scale_factor(window);
+    let incoming = render::surface_layers(
+        app.current_slide_element(scale, scale_factor, true, false, true),
         &app.media,
         app.slide_theme(app.deck.current_slide()),
         &app.deck.current_slide().overrides,
@@ -41,19 +43,40 @@ pub fn view(app: &App, window: window::Id) -> Element<'_, Message> {
             footnote: app.deck.current_slide().footnote.clone(),
             layer_images: app.deck.current_slide().layer_images.clone(),
             video: show_badge,
-            // The audience badge only appears while the clip is *not* playing,
-            // so it's always the ▶ poster.
+            // The audience badge only marks an external-player clip, so it's
+            // always ▶.
             video_playing: false,
             dither: true,
+            zoom: render::SurfaceZoom::easing(
+                app.deck.current_slide(),
+                app.deck.current_step(),
+                app.step_zoom_from(),
+            ),
         },
     );
+    let surface = match app.active_transition() {
+        Some((kind @ (transition::Kind::ContentWipe | transition::Kind::Pan(_)), progress)) => {
+            match (app.outgoing_layers(scale, scale_factor), kind) {
+                (Some((outgoing, shared)), transition::Kind::Pan(direction)) => {
+                    render::content_pan(outgoing, incoming, progress, direction, shared)
+                }
+                (Some((outgoing, shared)), _) => {
+                    render::content_wipe(outgoing, incoming, 1.0 - progress, shared)
+                }
+                (None, _) => incoming.into_element(),
+            }
+        }
+        _ => incoming.into_element(),
+    };
 
-    // Embedded video (the `video` feature, wgpu live): while the clip plays,
-    // the player draws over the slide content, sized to the canvas. Paused/idle
-    // clips aren't mounted — the poster badge stands in — so entering a video
-    // slide shows the affordance, not a frozen first frame.
+    // Embedded video (the `video` feature, wgpu live): once the clip has been
+    // played, the player draws over the slide content, sized to the canvas —
+    // while playing, and paused on its current frame. A clip not yet played
+    // isn't mounted (the poster badge stands in), so entering a video slide
+    // shows the affordance, not a frozen first frame.
     #[cfg(feature = "video")]
-    let surface: Element<'_, Message> = match app.embedded_video().filter(|_| playing) {
+    let surface: Element<'_, Message> = match app.embedded_video().filter(|_| app.video_on_screen())
+    {
         Some(video) => stack![
             surface,
             iced_video_player::VideoPlayer::new(video)
@@ -72,7 +95,7 @@ pub fn view(app: &App, window: window::Id) -> Element<'_, Message> {
             pointer: &app.pointer,
             accent: render::color(app.theme.colors.accent),
             scale,
-            scale_factor: app.window_scale_factor(window),
+            scale_factor,
         })
         .width(render::DESIGN_WIDTH * scale)
         .height(render::DESIGN_HEIGHT * scale);
@@ -98,10 +121,14 @@ pub fn view(app: &App, window: window::Id) -> Element<'_, Message> {
     // incoming slide and animate it away. The screenshot covers the whole
     // window (slide + letterbox), so it fills the window exactly.
     match app.active_transition() {
-        Some((handle, kind, progress)) => {
-            let overlay = transition_overlay(handle.clone(), kind, progress, size);
-            stack![base, overlay].into()
-        }
+        Some((kind, progress)) => match app.transition_frame() {
+            Some(handle) => {
+                let overlay = transition_overlay(handle.clone(), kind, progress);
+                stack![base, overlay].into()
+            }
+            // A content wipe: already composed into the slide above.
+            None => base,
+        },
         // At rest, render the current slide's cached frame *behind* the live
         // slide (fully occluded) so iced has finished its async GPU upload
         // before that frame is used as the next transition's overlay — without
@@ -126,7 +153,6 @@ fn transition_overlay(
     handle: image::Handle,
     kind: transition::Kind,
     progress: f32,
-    size: iced::Size,
 ) -> Element<'static, Message> {
     let frame = image(handle)
         .width(Fill)
@@ -134,27 +160,17 @@ fn transition_overlay(
         .content_fit(iced::ContentFit::Fill);
     match kind {
         // Cross-dissolve: fade the outgoing frame out to reveal the incoming.
-        transition::Kind::Dissolve | transition::Kind::None => {
-            container(frame.opacity(1.0 - progress))
-                .width(Fill)
-                .height(Fill)
-                .into()
-        }
-        // Wipe: clip the outgoing frame's width down from the left edge, so
-        // the incoming slide is revealed from the right. The inner frame keeps
-        // the full window width and is clipped by the shrinking container.
-        transition::Kind::Wipe => {
-            let visible = (size.width * (1.0 - progress)).max(0.0);
-            let curtain = container(
-                container(frame.width(size.width).height(size.height))
-                    .width(visible)
-                    .height(Fill)
-                    .clip(true),
-            )
+        transition::Kind::Dissolve
+        | transition::Kind::None
+        | transition::Kind::ContentWipe
+        | transition::Kind::Pan(_) => container(frame.opacity(1.0 - progress))
             .width(Fill)
             .height(Fill)
-            .align_x(iced::alignment::Horizontal::Left);
-            curtain.into()
-        }
+            .into(),
+        // Wipe: clip the outgoing frame's width down from the left edge, so
+        // the incoming slide is revealed from the right. The frame keeps the
+        // full window size; only its drawing is clipped (a narrowing container
+        // would squash it instead).
+        transition::Kind::Wipe => crate::clip::band(frame, 0.0, 1.0 - progress).into(),
     }
 }

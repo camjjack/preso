@@ -30,7 +30,7 @@ their own line; they're invisible in other markdown viewers.
 | `<!-- highlight: … clip -->` | [Clip to the image](../writing/images.md#clipping-to-a-transparent-image): confine a fill/spotlight wash to the image's opaque pixels, sparing the transparent background. |
 | `<!-- slide: hidden -->` | Drop the slide — it appears in neither the presentation nor the PDF. |
 | `<!-- slide: number=N -->` | Reset the slide number to `N`; later slides continue from there. |
-| `<!-- slide: transition=fade\|wipe\|none -->` | [Transition](../appendix/rendering.md#transitions) for the change *into* this slide, overriding the deck default. |
+| `<!-- slide: transition=fade\|wipe\|wipe-content\|pan\|pan-up\|…\|none -->` | [Transition](../appendix/rendering.md#transitions) for the change *into* this slide, overriding the deck default. |
 | `<!-- layout: TwoColumn -->` | [Two columns](../writing/two-columns.md), split at `***`. |
 | `<!-- layout: TwoColumn 2:1 -->` | Two columns with a left:right ratio. |
 
@@ -44,6 +44,7 @@ sit alongside the others (`<!-- slide: kind=section hidden -->`).
 |-----------|---------|
 | `<!-- pause -->` | Start a new [reveal step](../writing/reveal-steps.md). |
 | `<!-- highlight[n]: … -->` | [Image highlight](../writing/images.md#stepping-through-highlights) shown from reveal step `n` onward (mints steps by itself). |
+| `<!-- zoom[n]: x%,y%,Nx -->` | [Zoom the slide's content](../writing/reveal-steps.md#zooming-the-slide) onto a point from step `n` (`all` zooms back out; mints steps by itself). |
 | `<!-- v-click -->` | Synonym for `<!-- pause -->`. |
 | `<!-- note: … -->` | [Speaker note](../writing/reveal-steps.md#speaker-notes) (may span lines). |
 | `<!-- note[n]: … -->` | Note shown from reveal step `n` onward. |
@@ -63,6 +64,8 @@ After the language on a code/diagram fence, in `{…}`:
 | `{2\|5\|all}` | code | [Click-through](../writing/code.md#click-through-highlighting) stages; `all`/`none` clear. |
 | `{size=NN}` | code | [Code font size](../writing/code.md#font-size) for this block, design units. |
 | `{dim}` / `{background}` | code | [Override the highlight style](../writing/code.md#focus-mode) for this block. |
+| `{all\|3-4\|6 zoom}` | code | [Zoom onto](../writing/code.md#zooming-onto-lines) each stage's lines. |
+| `{all\|Layout\|Read, Parse zoom}` | diagrams | [Zoom onto](../writing/diagrams.md#zooming-onto-nodes) the nodes each stage names. |
 | `{align=left\|center\|right}` | code | [Horizontal placement](../writing/code.md#panel-width-and-alignment) of the block. |
 | `{width=NN%}` | diagrams, code, images | Size to a percentage of the content width (`width=100%` = full width for a code block). |
 | `{align=left\|center\|right}` | images | [Horizontal position](../writing/images.md#sizing-and-framing) (default `left`). |

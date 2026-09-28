@@ -137,7 +137,83 @@ impl CodeBlock {
             .filter_map(|t| t.strip_prefix("align="))
             .find(|v| matches!(*v, "left" | "center" | "right"))
     }
+
+    /// Whether a `zoom` flag is present: the click-through stages zoom the
+    /// block onto what they select, as well as highlighting it
+    /// (`` ```rust {all|3-7|12-15 zoom} ``).
+    pub fn zooms(&self) -> bool {
+        self.tokens().any(|t| t == ZOOM_FLAG)
+    }
+
+    /// First and last line (1-indexed) of the code the block zooms onto at
+    /// `stage` (clamped to the last stage): the span of that stage's
+    /// highlighted lines. `None` — the whole block — without a `zoom` flag
+    /// or for a stage with no specific lines (`all`).
+    pub fn zoom_lines_at(&self, stage: usize) -> Option<(usize, usize)> {
+        if !self.zooms() {
+            return None;
+        }
+        let lines = self.highlighted_lines_at(stage)?;
+        Some((*lines.first()?, *lines.last()?))
+    }
+
+    /// Node labels a diagram zooms onto at `stage` (clamped to the last
+    /// stage): that stage's text, split on commas, less any flags and
+    /// `key=value` tokens (`` ```mermaid {all|Layout|Parse, Paint zoom} ``).
+    /// Labels may contain spaces. `None` — the whole diagram — without a
+    /// `zoom` flag or for an `all` stage.
+    pub fn zoom_labels_at(&self, stage: usize) -> Option<Vec<String>> {
+        self.zoom_label_spans_at(stage)
+            .map(|labels| labels.into_iter().map(|(label, _)| label).collect())
+    }
+
+    /// [`Self::zoom_labels_at`], with where each label sits: a byte range
+    /// within [`Self::annotation`] (from its first word to its last), so an
+    /// editor can point at a label that names no node.
+    pub fn zoom_label_spans_at(
+        &self,
+        stage: usize,
+    ) -> Option<Vec<(String, std::ops::Range<usize>)>> {
+        if !self.zooms() {
+            return None;
+        }
+        let annotation = self.annotation.as_deref()?;
+        let inner = brace_inner(annotation)?;
+        // `brace_inner` trims, so find where the inner spec really starts.
+        let inner_at = inner.as_ptr() as usize - annotation.as_ptr() as usize;
+        let mut stages = Vec::new();
+        let mut at = 0;
+        for spec in inner.split('|') {
+            stages.push((spec, inner_at + at));
+            at += spec.len() + 1;
+        }
+        let (spec, spec_at) = stages[stage.min(stages.len() - 1)];
+
+        let mut labels = Vec::new();
+        let mut part_at = spec_at;
+        for part in spec.split(',') {
+            let words: Vec<(&str, usize)> = part
+                .split_whitespace()
+                .map(|w| (w, part_at + (w.as_ptr() as usize - part.as_ptr() as usize)))
+                .filter(|(w, _)| !w.contains('=') && !BLOCK_FLAGS.contains(w))
+                .collect();
+            if let (Some(&(_, start)), Some(&(last, last_at))) = (words.first(), words.last()) {
+                let label = words.iter().map(|(w, _)| *w).collect::<Vec<_>>().join(" ");
+                labels.push((label, start..last_at + last.len()));
+            }
+            part_at += part.len() + 1;
+        }
+        let whole = labels.len() == 1 && labels[0].0 == "all";
+        (!labels.is_empty() && !whole).then_some(labels)
+    }
 }
+
+/// The fence flag that makes click-through stages zoom.
+const ZOOM_FLAG: &str = "zoom";
+
+/// Bare word flags a fence annotation can carry, which are never part of a
+/// stage's line set or diagram labels.
+const BLOCK_FLAGS: &[&str] = &[ZOOM_FLAG, "transparent", "dim", "background"];
 
 /// Strip the `{…}` wrapper from a fence annotation, returning the inner spec.
 fn brace_inner(annotation: &str) -> Option<&str> {
@@ -500,31 +576,45 @@ pub struct Slide {
     pub layout: Layout,
     /// Per-slide style overrides.
     pub overrides: SlideOverrides,
+    /// Slide zooms (`<!-- zoom[n]: 40%,20%,2x -->`), in document order.
+    pub zooms: Vec<SlideZoom>,
+}
+
+/// A slide-level zoom: from reveal step `step` (`None` = from the start) the
+/// slide's content is magnified onto `focus`, or shown whole when `focus` is
+/// `None` (`<!-- zoom[n]: all -->`). The escape hatch for zooming onto
+/// anything, where a code block's lines or a diagram's labels don't reach.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SlideZoom {
+    pub step: Option<usize>,
+    pub focus: Option<ZoomFocus>,
+}
+
+/// Where a slide zoom looks: a centre point, as fractions (`0.0`–`1.0`) of
+/// the slide canvas, and a magnification (`>= 1`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ZoomFocus {
+    pub x: f32,
+    pub y: f32,
+    pub scale: f32,
 }
 
 impl Slide {
     /// For [`Layout::TwoColumn`]: split a step's source at the `***`
-    /// separator line. Returns `None` if there is no separator.
+    /// separator line. Returns `None` if the slide has no separator.
+    ///
+    /// A step before the separator is revealed is all left column, with the
+    /// right one still empty — so a slide whose left column reveals item by
+    /// item keeps its two-column shape from the first step instead of
+    /// starting full width and jumping when the `***` arrives.
     pub fn columns_at(&self, step: usize) -> Option<(String, String)> {
         if !matches!(self.layout, Layout::TwoColumn { .. }) {
             return None;
         }
-        let source = self.step_source(step);
-        let mut left = String::new();
-        let mut right = String::new();
-        let mut in_right = false;
-        let mut fence = crate::fence::Tracker::default();
-        for line in source.lines() {
-            let in_code = fence.process(line);
-            if !in_code && !in_right && line.trim() == "***" {
-                in_right = true;
-                continue;
-            }
-            let target = if in_right { &mut right } else { &mut left };
-            target.push_str(line);
-            target.push('\n');
-        }
-        in_right.then_some((left, right))
+        split_at_separator(self.step_source(step)).or_else(|| {
+            split_at_separator(&self.source)
+                .map(|_| (self.step_source(step).to_string(), String::new()))
+        })
     }
 
     /// Two-column split as `((left_src, left_slide), (right_src, right_slide))`.
@@ -578,7 +668,34 @@ impl Slide {
             .filter_map(|h| h.step)
             .max()
             .map_or(1, |s| s + 1);
-        self.steps.len().max(code_stages).max(highlight_stages)
+        // Step-gated slide zooms (`zoom[n]:`) likewise.
+        let zoom_stages = self
+            .zooms
+            .iter()
+            .filter_map(|z| z.step)
+            .max()
+            .map_or(1, |s| s + 1);
+        self.steps
+            .len()
+            .max(code_stages)
+            .max(highlight_stages)
+            .max(zoom_stages)
+    }
+
+    /// The slide zoom in force at `step`: the last `zoom` directive whose
+    /// step has been reached. `None` when the slide is shown whole.
+    pub fn zoom_at(&self, step: usize) -> Option<ZoomFocus> {
+        self.zooms
+            .iter()
+            .filter(|z| z.step.unwrap_or(0) <= step)
+            .max_by_key(|z| z.step.unwrap_or(0))
+            .and_then(|z| z.focus)
+    }
+
+    /// Whether anything on the slide zooms between reveal steps: a slide
+    /// zoom, or a code block or diagram with the `zoom` flag.
+    pub fn has_zoom(&self) -> bool {
+        !self.zooms.is_empty() || self.code_blocks.iter().any(CodeBlock::zooms)
     }
 
     /// Markdown to render at the given step (clamped).
@@ -601,11 +718,37 @@ impl Slide {
     }
 }
 
+/// Split markdown at its first `***` line outside code fences.
+fn split_at_separator(source: &str) -> Option<(String, String)> {
+    let mut left = String::new();
+    let mut right = String::new();
+    let mut in_right = false;
+    let mut fence = crate::fence::Tracker::default();
+    for line in source.lines() {
+        let in_code = fence.process(line);
+        if !in_code && !in_right && line.trim() == "***" {
+            in_right = true;
+            continue;
+        }
+        let target = if in_right { &mut right } else { &mut left };
+        target.push_str(line);
+        target.push('\n');
+    }
+    in_right.then_some((left, right))
+}
+
 /// ATX heading level (1–6) of the first non-blank line of `source`, or
 /// `None` if it is not a heading. CommonMark ATX rules: up to 3 spaces of
 /// indent, 1–6 `#`, then a space or end of line.
 pub fn leading_heading_level(source: &str) -> Option<u8> {
     let line = source.lines().find(|l| !l.trim().is_empty())?;
+    atx_heading(line).map(|(level, _)| level)
+}
+
+/// An ATX heading line's level (1–6) and its text, with any closing `#`
+/// run removed. `None` for any other line. CommonMark ATX rules: up to 3
+/// spaces of indent, 1–6 `#`, then a space or end of line.
+pub fn atx_heading(line: &str) -> Option<(u8, &str)> {
     let indent = line.len() - line.trim_start().len();
     if indent > 3 {
         return None; // 4+ spaces is an indented code block, not a heading.
@@ -613,11 +756,19 @@ pub fn leading_heading_level(source: &str) -> Option<u8> {
     let trimmed = line.trim_start();
     let hashes = trimmed.bytes().take_while(|&b| b == b'#').count();
     let rest = &trimmed[hashes..];
-    if (1..=6).contains(&hashes) && (rest.is_empty() || rest.starts_with(char::is_whitespace)) {
-        Some(hashes as u8)
-    } else {
-        None
+    if !(1..=6).contains(&hashes) || !(rest.is_empty() || rest.starts_with(char::is_whitespace)) {
+        return None;
     }
+    // A closing sequence only counts when whitespace separates it from the
+    // text (`# C#` keeps its `#`).
+    let text = rest.trim();
+    let unclosed = text.trim_end_matches('#');
+    let text = if unclosed.is_empty() || unclosed.ends_with(char::is_whitespace) {
+        unclosed.trim_end()
+    } else {
+        text
+    };
+    Some((hashes as u8, text))
 }
 
 /// Split `source` into its leading ATX heading line and everything after
@@ -716,6 +867,54 @@ mod tests {
         assert_eq!(b.highlighted_lines_at(1).unwrap(), [5].into());
         // `all` highlights everything → no specific line set.
         assert_eq!(b.highlighted_lines_at(2), None);
+    }
+
+    #[test]
+    fn zoom_follows_the_highlight_stages() {
+        let b = block("{all|3-7|12,15 zoom}");
+        assert!(b.zooms());
+        assert_eq!(b.stage_count(), 3);
+        assert_eq!(b.zoom_lines_at(0), None, "`all` shows the whole block");
+        assert_eq!(b.zoom_lines_at(1), Some((3, 7)));
+        // A scattered set zooms onto its whole span; the flag isn't a line.
+        assert_eq!(b.zoom_lines_at(2), Some((12, 15)));
+        assert_eq!(b.highlighted_lines_at(2).unwrap(), [12, 15].into());
+        // Without the flag, stages only highlight.
+        assert_eq!(block("{3-7}").zoom_lines_at(0), None);
+    }
+
+    #[test]
+    fn diagram_zoom_stages_are_labels() {
+        let b = CodeBlock {
+            language: Some("mermaid".into()),
+            annotation: Some("{all|Layout|Parse input, Paint zoom transparent width=80%}".into()),
+        };
+        assert_eq!(b.stage_count(), 3);
+        assert_eq!(b.zoom_labels_at(0), None);
+        assert_eq!(b.zoom_labels_at(1), Some(vec!["Layout".to_string()]));
+        assert_eq!(
+            b.zoom_labels_at(2),
+            Some(vec!["Parse input".to_string(), "Paint".to_string()])
+        );
+        // Other flags still read from the same annotation.
+        assert!(b.transparent_background());
+        assert_eq!(b.width_percent(), Some(80.0));
+        // Labels never read as highlighted lines.
+        assert_eq!(b.highlighted_lines_at(1), None);
+    }
+
+    #[test]
+    fn zoom_label_spans_point_into_the_annotation() {
+        let b = CodeBlock {
+            language: Some("mermaid".into()),
+            annotation: Some("{all|Parse input,  Paint zoom}".into()),
+        };
+        let ann = b.annotation.as_deref().unwrap();
+        let spans = b.zoom_label_spans_at(1).unwrap();
+        let text: Vec<&str> = spans.iter().map(|(_, r)| &ann[r.clone()]).collect();
+        assert_eq!(text, ["Parse input", "Paint"]);
+        assert_eq!(spans[0].0, "Parse input");
+        assert_eq!(b.zoom_label_spans_at(0), None, "`all` names nothing");
     }
 
     #[test]

@@ -26,7 +26,10 @@ A theme is resolved in this order:
 2. A file `<name>.toml` in a **theme search directory**
    (`~/.config/preso/themes/` on Linux/macOS, the platform config dir
    elsewhere) — so `theme: corporate` finds `…/preso/themes/corporate.toml`.
-3. A **path** to a `.toml` file.
+3. A **path** to a `.toml` file. In the frontmatter, a relative path is
+   taken from the deck's folder (like its images), so `theme:
+   themes/corporate.toml` works wherever you run preso from. On the command
+   line, `--theme` paths are relative to where you run it.
 
 If none matches, preso reports an error.
 

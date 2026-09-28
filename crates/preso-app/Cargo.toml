@@ -45,6 +45,9 @@ to PDF. Syntax-highlighted code, Mermaid and Graphviz diagrams, LaTeX \
 math, TOML themes, and incremental reveal steps included."""
 assets = [
     ["target/release/preso", "usr/bin/", "755"],
+    # The language server editors launch. Another crate's binary, so build it
+    # first: `cargo build --release --bin preso-lsp` (release.yml does).
+    ["target/release/preso-lsp", "usr/bin/", "755"],
     ["../../assets/linux/preso.desktop", "usr/share/applications/", "644"],
     ["../../assets/icons/preso-16.png", "usr/share/icons/hicolor/16x16/apps/preso.png", "644"],
     ["../../assets/icons/preso-24.png", "usr/share/icons/hicolor/24x24/apps/preso.png", "644"],

@@ -4,17 +4,23 @@
 //! rule: `---` on its own line splits slides, but only outside fenced code
 //! blocks.
 
+pub mod complete;
+pub mod edit;
 pub mod error;
 pub mod fence;
+pub mod hover;
 pub mod include;
+pub mod lint;
 pub mod model;
+pub mod outline;
 pub mod parser;
 pub mod state;
+pub mod style;
 
 pub use error::ParseError;
 pub use model::{
     Anchor, CodeBlock, Frontmatter, Highlight, HighlightMode, HighlightShape, ImageRef, ImageRow,
-    ImageText, ImageTextRun, LayerImage, Layout, MathBlock, Note, Slide, SlideOverrides, Table,
-    TableAlign, display_number, display_total,
+    ImageText, ImageTextRun, LayerImage, Layout, MathBlock, Note, Slide, SlideOverrides, SlideZoom,
+    Table, TableAlign, ZoomFocus, display_number, display_total,
 };
 pub use state::Deck;

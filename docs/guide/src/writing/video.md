@@ -21,13 +21,16 @@ There are two ways the clip plays, depending on how preso was built:
   fallback used when the `video` feature isn't compiled in, or you run with
   `--software`. See [External playback](#external-playback).
 
-In both cases the slide shows a centered ▶ play badge (also in the presenter
-preview and the exported PDF). While an inline clip is playing, the presenter's
-badge and status line switch to ⏸ (`⏸ V: pause video`) so you can tell at a
-glance that it's running on the audience window. There's no automatic
-thumbnail, so add your own poster — an `![](…)` image or a full-bleed
-[`background=`](images.md#full-bleed-backgrounds) — to fill the frame; inline
-playback draws the video over it.
+Before an inline clip plays, the slide shows the clip's **first frame** —
+unless the slide has a picture of its own (an `![](…)` image, an `image:` layer
+or a full-bleed [`background=`](images.md#full-bleed-backgrounds)), which then
+stands as the poster until you start the clip. Display math doesn't count as a
+poster. Inline playback draws the video over the slide.
+
+A slide played by an external player (or without the `video` feature) can't
+show frames, so it shows your poster with a centered ▶ play badge instead —
+add a poster there to fill the frame. The exported PDF always shows the poster
+and badge.
 
 ## Inline playback
 
@@ -58,9 +61,10 @@ Inline video uses [`iced_video_player`](https://crates.io/crates/iced_video_play
 Every clip in the deck is **preloaded when the deck loads** (and prerolled, so
 the first frame is ready), rather than on demand — so the first press plays
 instantly instead of stalling mid-talk while GStreamer builds the pipeline. The
-clips stay paused until you start them; until then the slide shows the poster +
-▶ badge. Editing the deck reloads only clips it newly references, so the
-authoring loop doesn't re-pay the cost.
+clips stay paused until you start them; until then the slide shows the first
+frame (or the poster). Pausing holds the current frame on the slide, so you
+can stop on a frame and talk about it. Editing the deck reloads only clips it
+newly references, so the authoring loop doesn't re-pay the cost.
 
 Controls (on the slide's clip):
 
@@ -69,10 +73,21 @@ Controls (on the slide's clip):
 | <kbd>Space</kbd> or <kbd>v</kbd> | Play / pause |
 | <kbd>←</kbd> | While playing, scrub back a few seconds |
 | <kbd>⌥</kbd><kbd>←</kbd> | While playing, rewind to the start |
+| <kbd>,</kbd> / <kbd>.</kbd> | Pause and step one frame back / on |
 
-Leaving the slide stops the clip (it stays loaded). While a clip plays the
-presenter's badge and status line show the ⏸ / rewind hints; the audience just
-sees the video over the slide. Because <kbd>Space</kbd> controls the clip on a
+The presenter window shows a **scrub bar** under the current slide while it has
+an inline clip: a small play / pause button, elapsed time, a bar to drag, and
+the clip's length. Drag it to
+move through the clip — the audience sees each frame you pass, paused or
+playing — and let go where you want it; pressing play carries on from there,
+even after the clip has reached its end.
+
+Leaving the slide stops the clip (it stays loaded); come back and it shows the
+frame it stopped on. The presenter's current-slide preview shows the same frame
+as the audience window and plays along with it, so you can see what they see
+and pause where you mean to; its status line shows the play / pause and rewind
+hints. The audience sees just the video, with no play button over it — the
+controls live in the presenter window. Because <kbd>Space</kbd> controls the clip on a
 video slide, advance with <kbd>→</kbd> / <kbd>PageDown</kbd> and step back with
 <kbd>PageUp</kbd> / <kbd>Backspace</kbd> / <kbd>↑</kbd>.
 

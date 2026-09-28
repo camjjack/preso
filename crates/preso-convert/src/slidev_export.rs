@@ -8,7 +8,9 @@
 
 use crate::{Conversion, yaml_scalar};
 use preso_core::fence;
-use preso_core::parser::{NoteOpen, directive, highlight_directive, parse_note_open, raw_deck};
+use preso_core::parser::{
+    NoteOpen, directive, highlight_directive, parse_note_open, raw_deck, zoom_directive,
+};
 
 /// Convert preso `source` (includes already expanded) to Slidev markdown.
 pub fn export(source: &str) -> anyhow::Result<Conversion> {
@@ -84,9 +86,14 @@ pub fn export(source: &str) -> anyhow::Result<Conversion> {
 fn push_transition(value: &str, fm: &mut Vec<String>, scope: &str, warnings: &mut Vec<String>) {
     let mapped = match value {
         "fade" | "dissolve" => Some("fade"),
-        // preso renders all motion names as a wipe; slide-left is the
-        // closest Slidev effect.
-        "wipe" | "slide" | "push" | "cover" => Some("slide-left"),
+        // Pans keep their direction (Slidev's slide-* moves the whole slide,
+        // where preso holds the design still). A wipe has no Slidev
+        // equivalent; slide-left is the nearest.
+        "pan" | "pan-left" | "slide" | "slide-left" | "push" | "push-left" => Some("slide-left"),
+        "pan-right" | "slide-right" | "push-right" => Some("slide-right"),
+        "pan-up" | "slide-up" | "push-up" => Some("slide-up"),
+        "pan-down" | "slide-down" | "push-down" => Some("slide-down"),
+        "wipe" | "cover" | "wipe-content" => Some("slide-left"),
         "none" => None,
         other => {
             warnings.push(format!("{scope}: unknown transition '{other}'; dropped"));
@@ -237,6 +244,10 @@ fn export_slide(src: &str, n: usize, warnings: &mut Vec<String>) -> Option<(Vec<
             );
             continue;
         }
+        if zoom_directive(trimmed).is_some() {
+            w.push("slide zoom (<!-- zoom: … -->) has no Slidev equivalent; dropped".into());
+            continue;
+        }
         if directive(trimmed, "table").is_some() {
             w.push("table size hint has no Slidev equivalent; dropped".into());
             continue;
@@ -354,7 +365,9 @@ fn push_line(chunks: &mut [String], line: &str) {
 /// Clean a fence-opening line for Slidev. Line-highlight annotations pass
 /// through — Slidev uses the same `{2,4-6}` / `{1|2|3}` / `all` syntax —
 /// while preso-only tokens (`size=`, `width=`, `align=`, `dim`,
-/// `transparent`, …) are dropped with a warning.
+/// `transparent`, `zoom`, …) are dropped with a warning. A diagram's
+/// annotation goes entirely: it has no lines to highlight, and its stages
+/// are node labels to zoom onto.
 fn sanitize_fence(line: &str) -> (String, Vec<String>) {
     let mut warnings = Vec::new();
     let indent_len = line.len() - line.trim_start_matches(' ').len();
@@ -371,6 +384,7 @@ fn sanitize_fence(line: &str) -> (String, Vec<String>) {
     if matches!(language, "dot" | "graphviz") {
         warnings.push("Slidev has no Graphviz support; the block stays plain code".into());
     }
+    let diagram = matches!(language, "mermaid" | "dot" | "graphviz");
 
     let inner = annotation
         .strip_prefix('{')
@@ -385,9 +399,10 @@ fn sanitize_fence(line: &str) -> (String, Vec<String>) {
                     .map(str::trim)
                     .filter(|t| !t.is_empty())
                     .filter(|t| {
-                        let keep = *t == "all"
-                            || t.chars()
-                                .all(|c| c.is_ascii_digit() || c == '-' || c == ',');
+                        let keep = !diagram
+                            && (*t == "all"
+                                || t.chars()
+                                    .all(|c| c.is_ascii_digit() || c == '-' || c == ','));
                         if !keep {
                             dropped.push(t);
                         }
@@ -593,6 +608,44 @@ mod tests {
         assert!(r.output.contains("transition: slide-left"));
         assert!(r.output.contains("transition: fade"));
         assert!(r.warnings.iter().any(|w| w.contains("approximated")));
+    }
+
+    #[test]
+    fn zooms_are_dropped_with_warnings() {
+        let src = "```rust {all|2-3 zoom}\nx\n```\n\n```mermaid {all|Layout|Parse, Paint zoom}\ngraph LR\n```\n\n<!-- zoom[1]: 40%,20%,2x -->\n";
+        let r = export(src).unwrap();
+        // Code keeps its highlight stages; the flag goes.
+        assert!(r.output.contains("```rust {all|2,3}") || r.output.contains("```rust {all|2-3}"));
+        // A diagram's label stages mean nothing to Slidev.
+        assert!(r.output.contains("```mermaid\n"), "{}", r.output);
+        assert!(!r.output.contains("zoom"));
+        assert!(r.warnings.iter().any(|w| w.contains("'zoom'")));
+        assert!(r.warnings.iter().any(|w| w.contains("slide zoom")));
+    }
+
+    #[test]
+    fn pans_keep_their_direction() {
+        for (preso, slidev) in [
+            ("pan-up", "slide-up"),
+            ("pan-right", "slide-right"),
+            ("slide-down", "slide-down"),
+        ] {
+            let r = export(&format!("---\ntransition: {preso}\n---\n\n# A\n")).unwrap();
+            assert!(
+                r.output.contains(&format!("transition: {slidev}")),
+                "{preso}"
+            );
+        }
+    }
+
+    #[test]
+    fn content_transitions_approximated_as_slide_left() {
+        for name in ["wipe-content", "pan"] {
+            let r = export(&format!("---\ntransition: {name}\n---\n\n# A\n")).unwrap();
+            assert!(r.output.contains("transition: slide-left"));
+            let warning = format!("'{name}' approximated");
+            assert!(r.warnings.iter().any(|w| w.contains(&warning)));
+        }
     }
 
     #[test]

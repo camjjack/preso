@@ -41,6 +41,23 @@ fn main() {
 ```
 ---
 
+## Zooming Into Code
+
+```rust {all|2|4-6 zoom}
+fn main() {
+    let deck = Deck::load("talk.md").unwrap();
+    for slide in deck.slides() {
+        println!("{}", slide.title());
+        render(slide);
+        sync_windows(slide);
+    }
+}
+```
+
+<!-- note: Same stages as the last slide plus a `zoom` flag: each press zooms onto the highlighted lines, and `all` opens on the whole listing. The block is last on the slide because it takes the space below it to zoom into. -->
+
+---
+
 <!-- layout: TwoColumn -->
 <!-- note: Only one column has a heading, so it spans the whole slide and both bodies start underneath it. Give the other column a heading too and they'd stay per-column instead. -->
 
@@ -91,6 +108,37 @@ graph TD
 
 ---
 
+## Zooming Into Diagrams
+
+```mermaid {width=70% all|Layout Engine|Presenter Window, Audience Window zoom}
+graph TD
+    A[talk.md] --> B[preso-core parser]
+    B --> C{Layout Engine}
+    C --> D[Presenter Window]
+    C --> E[Audience Window]
+    C --> F[PDF Export]
+```
+
+<!-- note: For a diagram the zoom stages are node labels. The last stage names two nodes, so it pans out to fit both. -->
+
+---
+
+## Zooming Into Anything
+
+| Crate | Job |
+|-------|-----|
+| `preso-core` | Markdown → slides |
+| `preso-style` | Theme TOML |
+| `preso-diagram` | Mermaid, Graphviz, math |
+| `preso-app` | The two windows |
+
+<!-- zoom[1]: 34%,28%,1.6x -->
+<!-- zoom[2]: all -->
+
+<!-- note: The escape hatch: `zoom[n]: x%,y%,Nx` puts that point of the slide in the middle, magnified. Only the content zooms; the background and chrome stay put. `zoom[2]: all` zooms back out. -->
+
+---
+
 ## Transparent Diagrams
 
 The `transparent` flag drops the light card — the diagram sits
@@ -105,6 +153,9 @@ graph LR
 <!-- note: Works for dot/graphviz fences too: {width=45% transparent}. -->
 
 ---
+
+<!-- slide: transition=pan-up -->
+<!-- note: The deck's `transition: slide` pans every slide in from the right; this one overrides it with `pan-up`, so the last slide's content slides off the top as this one rises in from below. Go back and it retraces the pan downwards; go on and the next slide pans in from the right again. -->
 
 ## Transparent Diagrams2
 
@@ -124,6 +175,7 @@ graph TD
     linkStyle 0 stroke:red,stroke-width:2px;
 ```   
 ---
+<!-- slide: transition=pan-left -->
 
 ## Graphviz Too
 
@@ -192,6 +244,11 @@ back part
 Inline `code with **not bold** inside`, an image, and unicode: 中文, العربية, emoji 🎉
 
 ![preso logo](assets/logo.png){width=25% border shadow}
+
+---
+
+<!-- video: showcase.mp4 -->
+<!-- note: A video slide: `video:` names a clip next to the deck. Its first frame shows until you press Space to play; the presenter's scrub bar pauses, drags and steps through it (`,` / `.` step a frame). Built without the `video` feature, V opens it in an external player instead. -->
 
 ---
 

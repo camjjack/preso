@@ -60,10 +60,12 @@ class Preso < Formula
   def install
     bin.install "preso"
     bin.install "preso-convert"
+    bin.install "preso-lsp"
   end
 
   test do
     assert_match version.to_s, shell_output("#{bin}/preso --version")
+    assert_match version.to_s, shell_output("#{bin}/preso-lsp --version")
   end
 end
 EOF
@@ -107,6 +109,7 @@ class PresoVideo < Formula
 
   def install
     bin.install "preso"
+    bin.install "preso-lsp"
     if OS.mac?
       # The release binary links GStreamer (and its glib/gettext deps)
       # through upstream's @rpath/lib*.dylib install names but ships no
@@ -128,6 +131,7 @@ class PresoVideo < Formula
 
   test do
     assert_match version.to_s, shell_output("#{bin}/preso --version")
+    assert_match version.to_s, shell_output("#{bin}/preso-lsp --version")
   end
 end
 EOF

@@ -5,7 +5,7 @@
 
 use crate::app::{App, Message};
 use crate::render;
-use iced::widget::{Column, column, container, row, scrollable, text};
+use iced::widget::{Column, button, column, container, row, scrollable, slider, text};
 use iced::{Element, Fill, FillPortion, Size, Task, window};
 
 /// The next-slide preview's fixed scale in the slide layout (1/16 ladder,
@@ -99,7 +99,7 @@ fn slide_layout(app: &App, window: window::Id, size: Size) -> Element<'_, Messag
     // Current-slide preview scale follows the presenter window size, so
     // the preview is a faithful miniature of the audience surface.
     let avail_width = (size.width - 48.0).max(300.0);
-    let avail_height = (size.height - 320.0).max(180.0);
+    let avail_height = (size.height - 320.0 - scrub_room(app)).max(180.0);
     let scale = render::quantize_scale(
         (avail_width / render::DESIGN_WIDTH).min(avail_height / render::DESIGN_HEIGHT),
     );
@@ -133,7 +133,7 @@ fn notes_layout(app: &App, window: window::Id, size: Size) -> Element<'_, Messag
     // Less the window padding (2 × 14), the status and help lines with their
     // gaps, the two labels and the preview frames.
     let inner_width = (size.width - 28.0).max(300.0);
-    let side_height = (size.height - 100.0 - 2.0 * 20.0 - GAP).max(180.0);
+    let side_height = (size.height - 100.0 - 2.0 * 20.0 - GAP - scrub_room(app)).max(180.0);
     let scale = render::quantize_scale(
         (inner_width * SIDE_SHARE / render::DESIGN_WIDTH)
             .min(side_height / (render::DESIGN_HEIGHT * (1.0 + MIN_NEXT_RATIO))),
@@ -192,6 +192,8 @@ fn status_line(app: &App) -> Element<'_, Message> {
     if slide.video.is_some() {
         if app.video_playing() {
             status.push_str("  |  ▮▮ Space: pause  ◀ ⌥◀: rewind");
+        } else if app.video_progress().is_some() {
+            status.push_str("  |  ▶ Space: play video  , .: frame");
         } else {
             status.push_str("  |  ▶ Space: play video");
         }
@@ -277,6 +279,7 @@ fn current_slide(app: &App, window: window::Id, scale: f32) -> Element<'_, Messa
             app.window_scale_factor(window),
             app.pointer.active(),
             app.authoring,
+            false,
         ),
         &app.media,
         app.slide_theme(slide),
@@ -290,18 +293,37 @@ fn current_slide(app: &App, window: window::Id, scale: f32) -> Element<'_, Messa
             )),
             footnote: slide.footnote.clone(),
             layer_images: slide.layer_images.clone(),
-            video: slide.video.is_some(),
-            // Presenter never renders the clip itself, so the badge is its only
-            // feedback: ⏸ while it plays on the audience window, ▶ otherwise.
+            // The ▶ poster until the clip has played; after that the clip
+            // itself shows here (below), as on the audience window.
+            video: slide.video.is_some() && !app.video_on_screen(),
             video_playing: app.video_playing(),
             dither: true,
+            zoom: render::SurfaceZoom::at(slide, deck.current_step()),
         },
     );
     // Laser/pen work from here too: positions convert to design space,
     // so they mirror live on the audience window (and vice versa). Suppressed
     // in author mode: its full-slide mouse_area would swallow drags meant for
     // the per-image author canvas (leftover strokes can keep `visible()` true).
-    if app.pointer.visible() && !app.authoring {
+    // The clip itself, once it's on the audience slide — so you can see what
+    // they see and pause on the frame you want. Both windows draw the one
+    // player: its frames upload to a texture they share, and its audio plays
+    // once.
+    #[cfg(feature = "video")]
+    let surface: Element<'_, Message> = match app.embedded_video().filter(|_| app.video_on_screen())
+    {
+        Some(video) => iced::widget::stack![
+            surface,
+            iced_video_player::VideoPlayer::new(video)
+                .width(render::DESIGN_WIDTH * scale)
+                .height(render::DESIGN_HEIGHT * scale)
+                .content_fit(iced::ContentFit::Contain)
+                .on_new_frame(Message::Noop)
+        ]
+        .into(),
+        None => surface,
+    };
+    let slide: Element<'_, Message> = if app.pointer.visible() && !app.authoring {
         let overlay = iced::widget::canvas(crate::overlay::Overlay {
             pointer: &app.pointer,
             accent: render::color(app.theme.colors.accent),
@@ -319,7 +341,62 @@ fn current_slide(app: &App, window: window::Id, scale: f32) -> Element<'_, Messa
             .into()
     } else {
         surface
+    };
+    match scrub_bar(app, render::DESIGN_WIDTH * scale) {
+        Some(bar) => column![slide, bar].spacing(SCRUB_GAP).into(),
+        None => slide,
     }
+}
+
+/// Height of the scrub bar under the current slide.
+const SCRUB_HEIGHT: f32 = 22.0;
+/// Space between the current slide and its scrub bar.
+const SCRUB_GAP: f32 = 6.0;
+
+/// Room to leave under the current slide for its scrub bar: none unless the
+/// slide has an inline clip.
+fn scrub_room(app: &App) -> f32 {
+    if app.video_progress().is_some() {
+        SCRUB_HEIGHT + SCRUB_GAP
+    } else {
+        0.0
+    }
+}
+
+/// A play/pause button, elapsed time, a draggable bar, and the length, for
+/// the current slide's inline clip — as wide as the slide above it. Dragging
+/// seeks the audience's clip (to the nearest keyframe while moving, the exact
+/// frame on release); a paused clip shows each frame it's dragged over.
+/// `None` on a slide without an inline clip.
+fn scrub_bar(app: &App, width: f32) -> Option<Element<'_, Message>> {
+    let (at, length) = app.video_progress()?;
+    let muted = render::color(app.theme.colors.muted);
+    let time = |t| text(crate::video::clock(t)).size(12).color(muted);
+    // The status line's glyphs: ⏸ isn't in every font preso draws with.
+    let glyph = if app.video_playing() { "▮▮" } else { "▶" };
+    let play = button(text(glyph).size(11).center().width(14))
+        .padding([1, 6])
+        .style(button::secondary)
+        .on_press(Message::ToggleVideo);
+    Some(
+        row![
+            play,
+            time(at),
+            slider(
+                0.0..=length.as_secs_f64(),
+                at.as_secs_f64(),
+                Message::VideoScrub
+            )
+            .step(0.01)
+            .on_release(Message::VideoScrubEnd),
+            time(length),
+        ]
+        .spacing(8)
+        .align_y(iced::alignment::Vertical::Center)
+        .width(width)
+        .height(SCRUB_HEIGHT)
+        .into(),
+    )
 }
 
 /// A hairline around a slide miniature, so its edge shows even when the
@@ -421,6 +498,18 @@ fn next_panel(app: &App, scale: f32, frame: bool) -> Column<'_, Message> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn language_server_knows_every_layout() {
+        // preso-lsp flags a `presenter:` outside `lint::PRESENTER_LAYOUTS`,
+        // so each listed name must pick a layout of its own.
+        let layouts: std::collections::HashSet<String> = preso_core::lint::PRESENTER_LAYOUTS
+            .iter()
+            .map(|name| format!("{:?}", Layout::from_frontmatter(Some(name))))
+            .collect();
+        assert_eq!(layouts.len(), preso_core::lint::PRESENTER_LAYOUTS.len());
+        assert_eq!(layouts.len(), 2, "every layout the presenter has is listed");
+    }
 
     #[test]
     fn layout_from_frontmatter() {

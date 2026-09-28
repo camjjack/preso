@@ -76,12 +76,30 @@ pub enum Role {
     Audience,
 }
 
-/// A slide transition animating on the audience window: the captured outgoing
-/// frame, the effect, and when it began.
+/// A slide transition animating on the audience window: the outgoing slide,
+/// the effect, and when it began.
 struct ActiveTransition {
     kind: crate::transition::Kind,
-    outgoing: iced::widget::image::Handle,
+    outgoing: Outgoing,
     started: std::time::Instant,
+}
+
+/// What a transition animates away from.
+enum Outgoing {
+    /// A screenshot of the outgoing slide (dissolve, wipe).
+    Frame(iced::widget::image::Handle),
+    /// The outgoing slide itself, re-rendered live so its content can wipe
+    /// on its own (content wipe, pan).
+    Slide(Box<LiveSlide>),
+}
+
+/// A slide kept renderable after navigating away from it: its position and
+/// the parsed markdown of the step it was at.
+struct LiveSlide {
+    index: usize,
+    step: usize,
+    md: markdown::Content,
+    cols: Option<Columns>,
 }
 
 /// A navigation intent, so the deck mutation can be deferred until the
@@ -125,6 +143,12 @@ pub enum Message {
     /// Periodic display-topology check: re-detect monitors so a screen
     /// plugged in (or unplugged) after launch re-runs auto placement.
     PollDisplays,
+    /// The presenter's play/pause button.
+    ToggleVideo,
+    /// The presenter's scrub bar moved to this many seconds into the clip.
+    VideoScrub(f64),
+    /// The scrub bar was let go: land exactly on the frame it was left at.
+    VideoScrubEnd,
     /// Swallowed interactions (e.g. audience-window link clicks).
     Noop,
 }
@@ -203,6 +227,9 @@ pub struct App {
     /// A slide transition in flight on the audience window: the captured
     /// outgoing frame plus its kind and start instant. See `transition`.
     transition: Option<ActiveTransition>,
+    /// A zoom easing between reveal steps on the audience window: the step
+    /// it left and when it began. See `zoom`.
+    step_zoom: Option<(usize, std::time::Instant)>,
     /// Screenshot of the current slide taken while it's *at rest* (no
     /// transition running), keyed by `(slide index, reveal step)`. Reused as
     /// the outgoing frame when navigating away — so a transition needs no
@@ -230,6 +257,11 @@ pub struct App {
     /// each starts paused and is played/paused by `V`. Owns the pipelines.
     #[cfg(feature = "video")]
     videos: std::collections::HashMap<String, crate::video::Embedded>,
+    /// Where the scrub bar is being dragged to, in seconds, while it is. The
+    /// bar shows this rather than the clip's position, which lags a moving
+    /// thumb while each seek lands.
+    #[cfg(feature = "video")]
+    scrub: Option<f64>,
 }
 
 /// Overview grid layout: thumbnail scale, gap between thumbnails, the room
@@ -436,6 +468,7 @@ impl App {
             auto_place,
             secondary_present: secondary.is_some(),
             transition: None,
+            step_zoom: None,
             frame_cache: None,
             pending_capture: false,
             epoch: SystemClock.now(),
@@ -443,6 +476,8 @@ impl App {
             gpu_active,
             #[cfg(feature = "video")]
             videos: std::collections::HashMap::new(),
+            #[cfg(feature = "video")]
+            scrub: None,
         };
         app.refresh_markdown();
         // Run the talk clock from launch so it's visible and counting straight
@@ -501,12 +536,15 @@ impl App {
         }
     }
 
+    /// `animated` eases a reveal step's zoom in (the audience window);
+    /// otherwise zooms show at rest, as the presenter should see them.
     pub fn current_slide_element(
         &self,
         scale: f32,
         scale_factor: f32,
         inert: bool,
         authoring: bool,
+        animated: bool,
     ) -> Element<'_, Message> {
         let slide = self.deck.current_slide();
         self.slide_body(
@@ -518,6 +556,7 @@ impl App {
             self.deck.current_step(),
             inert,
             authoring,
+            animated.then(|| self.step_zoom_from()).flatten(),
         )
     }
 
@@ -537,6 +576,7 @@ impl App {
         step: usize,
         inert: bool,
         authoring: bool,
+        zoom_from: Option<(usize, f32)>,
     ) -> Element<'a, Message> {
         let render_one = |content, code_slide| {
             let ctx = SlideContext {
@@ -552,6 +592,7 @@ impl App {
                 code_stage: None,
                 scale_factor,
                 authoring,
+                zoom_from,
             };
             if inert {
                 render::slide_inert(content, ctx)
@@ -613,6 +654,7 @@ impl App {
                         slide.step_count().saturating_sub(1),
                         true,
                         false,
+                        None,
                     );
                     let surface = render::slide_surface(
                         body,
@@ -631,6 +673,10 @@ impl App {
                             video: slide.video.is_some(),
                             video_playing: false,
                             dither: true,
+                            zoom: render::SurfaceZoom::at(
+                                slide,
+                                slide.step_count().saturating_sub(1),
+                            ),
                         },
                     );
                     let thumb = container(surface).clip(true).style(move |_| {
@@ -725,6 +771,7 @@ impl App {
             step,
             false,
             false,
+            None,
         );
         render::slide_surface(
             body,
@@ -740,6 +787,7 @@ impl App {
                 video: slide.video.is_some(),
                 video_playing: false,
                 dither: true,
+                zoom: render::SurfaceZoom::at(slide, step),
             },
         )
     }
@@ -886,6 +934,10 @@ impl App {
                     self.transition = None;
                     self.pending_capture = true;
                 }
+                if self.step_zoom.is_some() && self.step_zoom_from().is_none() {
+                    self.step_zoom = None;
+                    self.pending_capture = true;
+                }
                 Task::none()
             }
             Message::CaptureTick => {
@@ -902,6 +954,30 @@ impl App {
                 Task::none()
             }
             Message::PollDisplays => self.poll_displays(),
+            Message::ToggleVideo => {
+                self.play_current_video();
+                Task::none()
+            }
+            Message::VideoScrub(secs) => {
+                #[cfg(feature = "video")]
+                if let Some(clip) = self.current_clip_mut() {
+                    // The nearest keyframe while dragging, so seeks keep up.
+                    clip.seek_to(std::time::Duration::from_secs_f64(secs.max(0.0)), false);
+                    self.scrub = Some(secs);
+                }
+                #[cfg(not(feature = "video"))]
+                let _ = secs;
+                Task::none()
+            }
+            Message::VideoScrubEnd => {
+                #[cfg(feature = "video")]
+                if let Some(secs) = self.scrub.take()
+                    && let Some(clip) = self.current_clip_mut()
+                {
+                    clip.seek_to(std::time::Duration::from_secs_f64(secs.max(0.0)), true);
+                }
+                Task::none()
+            }
             Message::Noop => Task::none(),
         }
     }
@@ -1125,14 +1201,86 @@ impl App {
         }
     }
 
-    /// The in-flight audience transition as (outgoing frame, kind, eased
-    /// progress 0→1), or `None` if none is running (or it just finished).
-    pub fn active_transition(
-        &self,
-    ) -> Option<(&iced::widget::image::Handle, crate::transition::Kind, f32)> {
+    /// The in-flight audience transition as (kind, eased progress 0→1), or
+    /// `None` if none is running (or it just finished).
+    pub fn active_transition(&self) -> Option<(crate::transition::Kind, f32)> {
         let t = self.transition.as_ref()?;
         let p = crate::transition::progress(t.started, self.clock.now(), t.kind.duration())?;
-        Some((&t.outgoing, t.kind, p))
+        Some((t.kind, p))
+    }
+
+    /// The step a zoom is easing away from and its eased progress (0→1), or
+    /// `None` when no step's zoom is animating (or it just finished).
+    pub fn step_zoom_from(&self) -> Option<(usize, f32)> {
+        let (from, started) = self.step_zoom?;
+        let t = crate::transition::progress(started, self.clock.now(), crate::zoom::DURATION)?;
+        Some((from, t))
+    }
+
+    /// The captured outgoing frame of the transition in flight, for the
+    /// kinds that animate a screenshot.
+    pub fn transition_frame(&self) -> Option<&iced::widget::image::Handle> {
+        match &self.transition.as_ref()?.outgoing {
+            Outgoing::Frame(handle) => Some(handle),
+            Outgoing::Slide(_) => None,
+        }
+    }
+
+    /// The outgoing slide of a content wipe or pan as surface layers, plus
+    /// whether it shares the current slide's design (so only the content need
+    /// move). `None` when neither is running, or a reload removed the slide.
+    pub fn outgoing_layers(
+        &self,
+        scale: f32,
+        scale_factor: f32,
+    ) -> Option<(render::SurfaceLayers<'_>, bool)> {
+        let Outgoing::Slide(live) = &self.transition.as_ref()?.outgoing else {
+            return None;
+        };
+        let LiveSlide {
+            index,
+            step,
+            md,
+            cols,
+        } = live.as_ref();
+        let slide = self.deck.slides().get(*index)?;
+        let body = self.slide_body(
+            slide,
+            md,
+            cols.as_ref(),
+            scale,
+            scale_factor,
+            *step,
+            true,
+            false,
+            None,
+        );
+        let layers = render::surface_layers(
+            body,
+            &self.media,
+            self.slide_theme(slide),
+            &slide.overrides,
+            render::SurfaceOptions {
+                scale,
+                size: iced::Size::new(render::DESIGN_WIDTH * scale, render::DESIGN_HEIGHT * scale),
+                number: Some((self.deck.display_number(*index), self.deck.display_total())),
+                footnote: slide.footnote.clone(),
+                layer_images: slide.layer_images.clone(),
+                // Leaving the slide paused its clip, so it shows the poster.
+                video: slide.video.is_some(),
+                video_playing: false,
+                dither: true,
+                zoom: render::SurfaceZoom::at(slide, *step),
+            },
+        );
+        let current = self.deck.current_slide();
+        let shared = render::same_design(
+            self.slide_theme(slide),
+            &slide.overrides,
+            self.slide_theme(current),
+            &current.overrides,
+        );
+        Some((layers, shared))
     }
 
     /// The current slide's cached frame, to keep its GPU texture warm while at
@@ -1146,12 +1294,14 @@ impl App {
         ((*i, *s) == (self.deck.current_index(), self.deck.current_step())).then(|| handle.clone())
     }
 
-    /// Navigate the deck, animating a transition when one applies. The outgoing
-    /// slide is supplied by `frame_cache` — a screenshot taken earlier while
-    /// that slide was at rest — so no screenshot happens here on the critical
-    /// path (which would stall the first animation frame and flash). If there's
-    /// no clean cached frame for the slide we're leaving (very fast navigation,
-    /// or a transition still running), we simply cut.
+    /// Navigate the deck, animating a transition when one applies. For the
+    /// screenshot kinds the outgoing slide is supplied by `frame_cache` — a
+    /// screenshot taken earlier while that slide was at rest — so no
+    /// screenshot happens here on the critical path (which would stall the
+    /// first animation frame and flash). If there's no clean cached frame for
+    /// the slide we're leaving (very fast navigation, or a transition still
+    /// running), we simply cut. A content wipe or pan needs no frame: it keeps the
+    /// outgoing slide's parsed markdown and renders it live.
     fn navigate(&mut self, nav: Nav) -> Task<Message> {
         // A transient author hint belongs to the slide it was raised on.
         self.toast = None;
@@ -1160,21 +1310,47 @@ impl App {
         // Snap any in-flight transition; a new one starts only on a real slide
         // change with a matching cached outgoing frame.
         self.transition = None;
+        // Likewise a step's zoom: a new one eases from the step just left,
+        // when the slide stays and something on it zooms.
+        self.step_zoom = (self.deck.current_index() == before.0
+            && self.deck.current_step() != before.1
+            && self.deck.current_slide().has_zoom())
+        .then(|| (before.1, self.clock.now()));
         if self.deck.current_index() != before.0 {
             // Leaving a slide stops any clip that was playing on it.
             #[cfg(feature = "video")]
             self.pause_all_videos();
-            let kind = self.current_transition_kind();
-            if kind != crate::transition::Kind::None
-                && let Some((idx, step, handle)) = &self.frame_cache
-                && (*idx, *step) == before
-            {
-                self.transition = Some(ActiveTransition {
-                    kind,
-                    outgoing: handle.clone(),
-                    started: self.clock.now(),
-                });
-            }
+            // A transition belongs to the boundary it crosses: moving on
+            // plays the incoming slide's; going back plays the one the slide
+            // we're leaving came in with, reversed, so a pan retraces its
+            // path.
+            let kind = if self.deck.current_index() > before.0 {
+                self.transition_into(self.deck.current_index())
+            } else {
+                self.transition_into(before.0).reversed()
+            };
+            let outgoing = match kind {
+                crate::transition::Kind::None => None,
+                kind if !kind.needs_frame() => {
+                    Some(Outgoing::Slide(Box::new(LiveSlide {
+                        index: before.0,
+                        step: before.1,
+                        // `refresh_markdown` below replaces both anyway.
+                        md: std::mem::replace(&mut self.current_md, markdown::Content::parse("")),
+                        cols: self.current_cols.take(),
+                    })))
+                }
+                _ => self
+                    .frame_cache
+                    .as_ref()
+                    .filter(|(idx, step, _)| (*idx, *step) == before)
+                    .map(|(_, _, handle)| Outgoing::Frame(handle.clone())),
+            };
+            self.transition = outgoing.map(|outgoing| ActiveTransition {
+                kind,
+                outgoing,
+                started: self.clock.now(),
+            });
         }
         self.refresh_markdown();
         // Request an at-rest capture of the new slide for next time — but only
@@ -1183,7 +1359,7 @@ impl App {
         // subscription churns a redraw right at the transition's first frame.
         // When a transition is running, the end-of-transition tick requests the
         // capture instead.
-        self.pending_capture = self.transition.is_none();
+        self.pending_capture = self.transition.is_none() && self.step_zoom.is_none();
         if self.deck.current_index() != before.0 {
             // A new slide's notes start at the top, not wherever the last
             // slide's were scrolled to. (A reveal step keeps the position:
@@ -1211,14 +1387,15 @@ impl App {
     }
 
     /// Screenshot the current slide for `frame_cache` when it's safe and useful:
-    /// the deck transitions somewhere, no transition is running (so the frame is
+    /// some transition in the deck animates a screenshot, no transition is running (so the frame is
     /// clean, and the readback's event-loop stall is invisible on static
     /// content), an audience window exists, and we don't already have this
     /// exact `(index, step)` cached.
     fn capture_current_if_idle(&self) -> Task<Message> {
         let key = (self.deck.current_index(), self.deck.current_step());
         if self.transition.is_some()
-            || !self.deck_uses_transitions()
+            || self.step_zoom.is_some()
+            || !self.deck_uses_frame_transitions()
             || self.frame_cache.as_ref().map(|(i, s, _)| (*i, *s)) == Some(key)
         {
             return Task::none();
@@ -1248,32 +1425,31 @@ impl App {
         }
     }
 
-    /// The transition kind for the change *into* the current slide: its
+    /// The transition kind for the change *into* slide `index`: its
     /// per-slide `transition=` override if set, else the deck default.
-    fn current_transition_kind(&self) -> crate::transition::Kind {
+    fn transition_into(&self, index: usize) -> crate::transition::Kind {
         let raw = self
             .deck
-            .current_slide()
-            .overrides
-            .transition
-            .as_deref()
+            .slides()
+            .get(index)
+            .and_then(|slide| slide.overrides.transition.as_deref())
             .or(self.deck.frontmatter.transition.as_deref());
         crate::transition::Kind::from_frontmatter(raw)
     }
 
-    /// Whether any slide change in this deck could animate — the deck default
-    /// is a real transition, or some slide carries a non-`none` override. Gates
-    /// the per-navigation frame capture.
-    fn deck_uses_transitions(&self) -> bool {
+    /// Whether any slide change in this deck could animate a screenshot — the
+    /// deck default is a dissolve or wipe, or some slide overrides to one.
+    /// Gates the per-navigation frame capture.
+    fn deck_uses_frame_transitions(&self) -> bool {
         use crate::transition::Kind;
-        if Kind::from_frontmatter(self.deck.frontmatter.transition.as_deref()) != Kind::None {
+        if Kind::from_frontmatter(self.deck.frontmatter.transition.as_deref()).needs_frame() {
             return true;
         }
         self.deck.slides().iter().any(|s| {
             s.overrides
                 .transition
                 .as_deref()
-                .is_some_and(|t| Kind::from_frontmatter(Some(t)) != Kind::None)
+                .is_some_and(|t| Kind::from_frontmatter(Some(t)).needs_frame())
         })
     }
 
@@ -1364,6 +1540,38 @@ impl App {
             .map(crate::video::Embedded::video)
     }
 
+    /// Whether the current slide's clip should be drawn over it: once it has
+    /// played (paused, it holds its current frame), and before that too — as
+    /// its first frame — unless the slide has a picture of its own to show
+    /// until it plays (see [`render::has_poster`]). Always `false` without
+    /// the `video` feature.
+    pub fn video_on_screen(&self) -> bool {
+        #[cfg(feature = "video")]
+        {
+            let slide = self.deck.current_slide();
+            slide
+                .video
+                .as_deref()
+                .and_then(|rel| self.videos.get(rel))
+                .is_some_and(|e| e.started() || e.is_playing() || !render::has_poster(slide))
+        }
+        #[cfg(not(feature = "video"))]
+        false
+    }
+
+    /// Whether the current slide's clip plays inline, controlled from the
+    /// presenter's play button and scrub bar. When it doesn't (no `video`
+    /// feature, the software renderer, a clip that failed to load), `V` hands
+    /// it to an external player and the slide keeps its ▶ badge.
+    pub fn video_inline(&self) -> bool {
+        #[cfg(feature = "video")]
+        {
+            self.gpu_active && self.current_video_loaded()
+        }
+        #[cfg(not(feature = "video"))]
+        false
+    }
+
     /// Whether the current slide's clip is loaded and actively playing (not
     /// paused). Drives the play/pause badge and the audience's inline render.
     /// Always `false` without the `video` feature (external playback has no
@@ -1376,7 +1584,7 @@ impl App {
                 .video
                 .as_deref()
                 .and_then(|rel| self.videos.get(rel))
-                .is_some_and(|e| !e.video().paused())
+                .is_some_and(crate::video::Embedded::is_playing)
         }
         #[cfg(not(feature = "video"))]
         false
@@ -1413,6 +1621,45 @@ impl App {
                 }
             }
         }
+    }
+
+    /// The current slide's loaded clip, to control.
+    #[cfg(feature = "video")]
+    fn current_clip_mut(&mut self) -> Option<&mut crate::video::Embedded> {
+        let rel = self.deck.current_slide().video.clone()?;
+        self.videos.get_mut(&rel)
+    }
+
+    /// The current slide's inline clip as (position, length) for the
+    /// presenter's scrub bar — the dragged-to point while the bar is being
+    /// dragged. `None` without an inline clip, or before its length is known.
+    pub fn video_progress(&self) -> Option<(std::time::Duration, std::time::Duration)> {
+        #[cfg(feature = "video")]
+        {
+            let rel = self.deck.current_slide().video.as_deref()?;
+            let clip = self.videos.get(rel)?;
+            let length = clip.duration();
+            let at = match self.scrub {
+                Some(secs) => std::time::Duration::from_secs_f64(secs.max(0.0)),
+                None => clip.position(),
+            };
+            (!length.is_zero()).then_some((at.min(length), length))
+        }
+        #[cfg(not(feature = "video"))]
+        None
+    }
+
+    /// `,` / `.`: pause the current slide's clip and step a frame back or on.
+    fn step_video(&mut self, frames: i32) {
+        #[cfg(feature = "video")]
+        if self.gpu_active
+            && !self.overview
+            && let Some(clip) = self.current_clip_mut()
+        {
+            clip.step(frames);
+        }
+        #[cfg(not(feature = "video"))]
+        let _ = frames;
     }
 
     /// Pause every loaded clip — used when leaving a slide so a playing clip
@@ -1477,6 +1724,10 @@ impl App {
                 self.toast = self
                     .authoring
                     .then(|| "highlight author: drag a box on an image".to_string());
+                Task::none()
+            }
+            keyboard::Action::StepVideo(frames) => {
+                self.step_video(frames);
                 Task::none()
             }
             keyboard::Action::PlayVideo => {
@@ -1612,13 +1863,23 @@ impl App {
     /// honoured the same way. Built-in themes resolve to the same value, so
     /// this is a cheap no-op for them.
     fn reload_theme(&mut self) {
-        let name = self
-            .theme_override
-            .clone()
-            .or_else(|| self.deck.frontmatter.theme.clone());
-        let resolved = match &name {
-            Some(name) => preso_style::load_with_search(name, &theme_search_dirs()),
-            None => Ok(preso_style::Theme::default()),
+        // A `--theme` path is taken from where preso was run; the
+        // frontmatter's from the deck's folder (see `main`).
+        let deck_dir = self
+            .path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(std::path::Path::new("."));
+        let (name, resolved) = match (&self.theme_override, &self.deck.frontmatter.theme) {
+            (Some(name), _) => (
+                Some(name.clone()),
+                preso_style::load_with_search(name, &theme_search_dirs()),
+            ),
+            (None, Some(name)) => (
+                Some(name.clone()),
+                preso_style::load_for_deck(name, &theme_search_dirs(), deck_dir),
+            ),
+            (None, None) => (None, Ok(preso_style::Theme::default())),
         };
         match resolved {
             Ok(theme) if theme != self.theme => {
@@ -1671,8 +1932,9 @@ impl App {
         if self.timer.running() {
             subscriptions.push(every(std::time::Duration::from_secs(1)).map(|()| Message::Tick));
         }
-        // ~30fps heartbeat while a transition is animating or a GIF is showing.
-        if self.transition.is_some() || self.current_has_gif {
+        // ~30fps heartbeat while a transition or zoom is animating or a GIF
+        // is showing.
+        if self.transition.is_some() || self.step_zoom.is_some() || self.current_has_gif {
             subscriptions.push(every(std::time::Duration::from_millis(33)).map(|()| Message::Tick));
         }
         // A capture is pending: tick on rendered frames so we screenshot the
@@ -1981,6 +2243,35 @@ mod tests {
     }
 
     #[test]
+    fn going_back_retraces_the_pan_you_came_in_on() {
+        use crate::transition::{Direction, Kind};
+        let src = "---\ntransition: pan\n---\n# One\n\n---\n\n<!-- slide: transition=pan-up -->\n# Two\n\n---\n\n# Three\n";
+        let (mut app, _task) = App::new(
+            std::path::PathBuf::from("deck.md"),
+            src.to_string(),
+            preso_style::Theme::default(),
+            None,
+            false,
+            None,
+            false,
+        );
+        let kind = |app: &App| app.transition.as_ref().map(|t| t.kind);
+
+        // Into Two: its own pan-up. Into Three: the deck's pan (left).
+        let _ = app.navigate(Nav::Next);
+        assert_eq!(kind(&app), Some(Kind::Pan(Direction::Up)));
+        let _ = app.navigate(Nav::Next);
+        assert_eq!(kind(&app), Some(Kind::Pan(Direction::Left)));
+
+        // Back from Three retraces the pan into Three; back from Two
+        // retraces Two's pan-up — not One's, which is the deck default.
+        let _ = app.navigate(Nav::Prev);
+        assert_eq!(kind(&app), Some(Kind::Pan(Direction::Right)));
+        let _ = app.navigate(Nav::Prev);
+        assert_eq!(kind(&app), Some(Kind::Pan(Direction::Down)));
+    }
+
+    #[test]
     fn a_layout_switch_survives_reloads_until_the_deck_changes_it() {
         let dir = std::env::temp_dir().join(format!("preso-layout-reload-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -2010,6 +2301,165 @@ mod tests {
         std::fs::write(&path, "---\npresenter: slide\n---\n# One\n").unwrap();
         app.reload();
         assert_eq!(app.presenter_layout, presenter::Layout::Slide);
+    }
+
+    #[cfg(feature = "video")]
+    #[test]
+    fn a_clip_shows_its_first_frame_unless_the_slide_has_a_poster() {
+        let dir = std::env::temp_dir().join(format!("preso-first-frame-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let made = std::process::Command::new("ffmpeg")
+            .args(["-y", "-loglevel", "error", "-f", "lavfi"])
+            .args([
+                "-i",
+                "testsrc=duration=1:size=64x48:rate=10",
+                "-pix_fmt",
+                "yuv420p",
+            ])
+            .arg(dir.join("clip.mp4"))
+            .status()
+            .is_ok_and(|s| s.success());
+        if !made {
+            eprintln!("skipping: ffmpeg isn't installed");
+            return;
+        }
+        std::fs::write(dir.join("still.png"), b"").unwrap();
+        // Clips are keyed by path, so the second slide gets its own.
+        std::fs::copy(dir.join("clip.mp4"), dir.join("other.mp4")).unwrap();
+        let deck_path = dir.join("deck.md");
+        let deck =
+            "<!-- video: clip.mp4 -->\n\n---\n\n![still](still.png)\n<!-- video: other.mp4 -->\n";
+        std::fs::write(&deck_path, deck).unwrap();
+        let (mut app, _task) = App::new(
+            deck_path,
+            deck.to_string(),
+            preso_style::Theme::default(),
+            None,
+            false,
+            None,
+            true,
+        );
+        // A bare video slide shows the clip's first frame before it plays,
+        // and — the clip being inline — no ▶ badge on the audience.
+        assert!(app.video_inline());
+        assert!(app.video_on_screen() && !app.video_playing());
+        // The presenter's button plays and pauses it.
+        let _ = app.update(Message::ToggleVideo);
+        assert!(app.video_playing());
+        let _ = app.update(Message::ToggleVideo);
+        assert!(!app.video_playing() && app.video_on_screen());
+
+        // A slide with its own picture shows that until the clip plays.
+        let _ = app.navigate(Nav::Next);
+        assert!(!app.video_on_screen());
+        let _ = app.update(Message::ToggleVideo);
+        assert!(app.video_on_screen());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(feature = "video")]
+    #[test]
+    fn the_scrub_bar_and_frame_keys_move_the_clip() {
+        use std::time::Duration;
+        let dir = std::env::temp_dir().join(format!("preso-scrub-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let clip = dir.join("clip.mp4");
+        let made = std::process::Command::new("ffmpeg")
+            .args(["-y", "-loglevel", "error", "-f", "lavfi"])
+            .args([
+                "-i",
+                "testsrc=duration=2:size=64x48:rate=10",
+                "-pix_fmt",
+                "yuv420p",
+            ])
+            .arg(&clip)
+            .status()
+            .is_ok_and(|s| s.success());
+        if !made {
+            eprintln!("skipping: ffmpeg isn't installed");
+            return;
+        }
+        let deck_path = dir.join("deck.md");
+        let deck = "# Clip\n\n<!-- video: clip.mp4 -->\n";
+        std::fs::write(&deck_path, deck).unwrap();
+        let (mut app, _task) = App::new(
+            deck_path,
+            deck.to_string(),
+            preso_style::Theme::default(),
+            None,
+            false,
+            None,
+            true, // wgpu "live", so the clip loads inline
+        );
+        let settled = |app: &App, want: Duration| {
+            (0..100).any(|_| {
+                let (at, _) = app.video_progress().expect("inline clip");
+                let close = at.abs_diff(want) <= Duration::from_millis(60);
+                if !close {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                close
+            })
+        };
+        let (_, length) = app.video_progress().expect("the slide has an inline clip");
+        assert!(length > Duration::from_millis(1_900), "{length:?}");
+        // No poster, so the clip's first frame is up before it plays.
+        assert!(app.video_on_screen());
+
+        // Dragging: the bar shows where it's dragged, whatever the seek has
+        // reached.
+        let _ = app.update(Message::VideoScrub(1.2));
+        assert_eq!(
+            app.video_progress().unwrap().0,
+            Duration::from_millis(1_200)
+        );
+        // Let go: it lands on that frame.
+        let _ = app.update(Message::VideoScrubEnd);
+        assert!(settled(&app, Duration::from_millis(1_200)));
+
+        // `,` and `.` step a frame (100 ms at 10 fps).
+        app.step_video(1);
+        assert!(settled(&app, Duration::from_millis(1_300)));
+        app.step_video(-2);
+        assert!(settled(&app, Duration::from_millis(1_100)));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_frontmatter_theme_path_is_found_beside_the_deck() {
+        // Run from elsewhere (the test runs from the crate), the deck's
+        // `theme: themes/t.toml` still means the one next to the deck.
+        let dir = std::env::temp_dir().join(format!("preso-theme-rel-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("themes")).unwrap();
+        std::fs::write(
+            dir.join("themes/t.toml"),
+            "name = \"t\"\ncode_theme = \"base16-ocean.dark\"\n\
+             [colors]\nbackground = \"#0a0b0c\"\ntext = \"#ffffff\"\nheading = \"#ffffff\"\n\
+             accent = \"#ffffff\"\nlink = \"#ffffff\"\nmuted = \"#888888\"\n\
+             code_background = \"#111111\"\n\
+             [fonts]\nbody_size = 36\nh1_size = 80\nh2_size = 56\nh3_size = 44\ncode_size = 30\n\
+             [spacing]\nslide_padding = 60\nparagraph_gap = 20\n",
+        )
+        .unwrap();
+        let deck_path = dir.join("deck.md");
+        std::fs::write(&deck_path, "---\ntheme: themes/t.toml\n---\n\n# Hi\n").unwrap();
+
+        let (mut app, _task) = App::new(
+            deck_path.clone(),
+            std::fs::read_to_string(&deck_path).unwrap(),
+            preso_style::Theme::default(),
+            None,
+            false,
+            None,
+            false,
+        );
+        app.reload();
+        assert!(app.error.is_none(), "{:?}", app.error);
+        assert_eq!(
+            app.theme.colors.background,
+            preso_style::Color::rgb(10, 11, 12)
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

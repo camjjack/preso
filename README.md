@@ -13,6 +13,12 @@ No browser, no Electron, no network. Slides render on the GPU (wgpu) by
 default, with a software rasterizer (tiny-skia) fallback via `--software` for
 machines where the GPU backend misbehaves.
 
+<p align="center">
+  <a href="docs/showcase.mp4"><img src="docs/assets/showcase.png" alt="The example talk's markdown beside the slide preso renders from it" width="860"></a>
+</p>
+
+<p align="center"><a href="docs/showcase.mp4">▶ Watch the tour</a>: <a href="docs/example-talk.md"><code>docs/example-talk.md</code></a>, slide by slide, beside what preso renders.</p>
+
 ## Features
 
 - **Plain-markdown decks** — slides separated by `---`, with YAML frontmatter.
@@ -25,8 +31,8 @@ machines where the GPU backend misbehaves.
   independently via `[title]` / `[section]` overlays.
 - **Layouts** — two-column (`<!-- layout: TwoColumn 2:1 -->`) with per-slide
   ratios and aligned column bodies.
-- **Alignment** — vertical (`align`) and horizontal (`halign`:
-  left/centre/right) per-slide or per-theme.
+- **Alignment** — vertical (`align`: `top` / `center`) and horizontal
+  (`halign`: `left` / `center` / `right`) per-slide or per-theme.
 - **Reveal steps** — `<!-- pause -->` builds a slide up incrementally.
 - **Code** — syntax highlighting, line highlighting (` ```rust {2,4-6} `), and a
   "focus mode" that dims everything except the selected lines.
@@ -36,10 +42,15 @@ machines where the GPU backend misbehaves.
   full-bleed cover backgrounds.
 - **Annotation** — laser pointer and pen drawing over the live audience window.
 - **Video** — mark a slide with `<!-- video: clip.mp4 -->`; plays inline on the
-  slide with the `video` feature (GStreamer), or via a fullscreen external
-  player otherwise.
-- **PDF & PowerPoint export** — one page per slide, one page per reveal step, or a 2-up
-  handout layout. Fully headless (no window opened).
+  slide with the `video` feature (GStreamer), controlled from a play button and
+  scrub bar in the presenter view, or via a fullscreen external player
+  otherwise.
+- **PDF & PowerPoint export** — one page per slide or one per reveal step, plus
+  a 2-up handout layout for PDF. PowerPoint export makes each slide a
+  full-bleed picture, exactly as presented. Fully headless (no window opened).
+- **Importing and converting** — `preso-convert` turns a Slidev deck or a
+  PowerPoint file into preso markdown, and a preso deck into Slidev or an
+  editable PowerPoint.
 
 ## Installation
 
@@ -95,12 +106,28 @@ Prebuilt binaries for macOS (Apple Silicon), Linux (x86_64), and Windows
 [Releases page](https://github.com/camjjack/preso/releases). The binary is
 self-contained (fonts and the built-in themes are embedded), so just unpack
 and run it. This is the route for Windows, and for anyone not using Homebrew.
+The standard archives also include `preso-convert` (see [Usage](#usage)).
 
 Each release also ships a `-video` variant with inline video playback compiled
 in (the `video` feature). Those link GStreamer, so they need it installed at run
 time — see [Video](#video) for the per-platform install. (Installing via
-`brew install preso-video` handles that for you.) The plain binaries have no
-such dependency and fall back to an external player for video slides.
+`brew install preso-video` or the `preso-video` Debian package handles that for
+you.) The plain binaries have no such dependency and fall back to an external
+player for video slides. The `-video` archives don't include `preso-convert`.
+
+### Debian / Ubuntu packages
+
+Each release also attaches x86_64 `.deb` packages: `preso`, and `preso-video`,
+whose dependencies pull in the GStreamer runtime and plugins that inline video
+needs. Install one or the other (they replace each other):
+
+```sh
+sudo apt install ./preso_*_amd64.deb         # or: ./preso-video_*_amd64.deb
+```
+
+The packages install `preso` with a desktop entry and icons. They don't include
+`preso-convert`, which comes in the release archives, the Homebrew `preso`
+formula and the Nix flake.
 
 ### Nix
 
@@ -170,6 +197,17 @@ sudo apt-get install -y \
   libxcb-shape0-dev libxcb-xfixes0-dev
 ```
 
+### Editor support
+
+Every install route above also installs `preso-lsp`, a language server that
+makes editors preso-aware: a slide outline, problems reported as you type,
+completion, hover help, and one-command slide and layout actions. For VS Code,
+install `preso-vscode-<version>.vsix` from the
+[Releases page](https://github.com/camjjack/preso/releases); for Zed, the
+extension is in [`editors/zed`](editors/zed). Any other editor with an LSP
+client can run `preso-lsp` for markdown files. See *Editor Support* in the
+guide for setup.
+
 ## Usage
 
 ```sh
@@ -183,6 +221,14 @@ preso deck.md --duration 30            # 30-minute countdown in the presenter vi
 preso deck.md --export-pdf out.pdf            # one page per slide
 preso deck.md --export-pdf out.pdf --export-steps  # one page per reveal step
 preso deck.md --export-pdf out.pdf --export-2up    # 2-up handout
+preso deck.md --export-pptx out.pptx          # PowerPoint, one picture per slide
+                                              # (--export-steps works here too)
+
+# Convert other formats to preso markdown, or a preso deck to them:
+preso-convert slides.md -o deck.md            # Slidev → preso
+preso-convert talk.pptx -o deck.md            # PowerPoint → preso
+preso-convert deck.md --to pptx -o deck.pptx  # preso → editable PowerPoint
+preso-convert deck.md --to slidev -o slides.md
 ```
 
 The renderer defaults to the GPU (wgpu) backend; both backends are compiled into
@@ -201,11 +247,20 @@ binary.
 | digits then `Enter` | Jump to slide number |
 | `Esc` | Toggle the slide overview grid |
 | `f` | Toggle fullscreen |
-| `v` | Play/pause the current slide's video |
+| `n` | Switch the presenter layout (slide-first ↔ notes-first) |
 | `r` | Reset the timer |
+| `v` | Play/pause the current slide's video (or open it in an external player) |
+| `,` / `.` | Pause an inline video and step one frame back / on |
 | `l` | Toggle laser pointer (audience window) |
 | `p` | Toggle pen annotation |
 | `c` | Clear annotations |
+| `h` | Toggle highlight authoring: in the presenter window, drag a box over an image to copy a `<!-- highlight: … -->` directive |
+
+On a slide with an inline video, `Space` plays and pauses the clip instead of
+advancing, and while it plays `←` scrubs back a few seconds (`⌥←` / `Alt+←`
+rewinds to the start). The other navigation keys work as usual. See the
+[keyboard reference](docs/guide/src/reference/keyboard.md) for the full
+details.
 
 ## Video
 
@@ -219,28 +274,35 @@ Mark a slide as playable with a comment (path relative to the deck file):
 <!-- video: clips/demo.mp4 -->
 ```
 
-The slide shows a ▶ badge and <kbd>v</kbd> plays the clip. How it plays depends
-on the build:
+How the clip plays depends on the build:
 
 - **Inline** (on the slide, with audio) — needs a binary built with the `video`
   feature and the wgpu backend (the default). The `-video` release artifacts and
-  a `cargo build --release --features video` both provide this.
-- **External** — the plain binaries (and any run with `--software`) hand the clip
-  to a fullscreen external player: [`mpv`](https://mpv.io) if it's on your `PATH`
-  (recommended), otherwise the OS default opener.
+  packages, Nix, and a `cargo build --release --features video` all provide
+  this. Before it plays, the slide shows the clip's first frame, or the slide's
+  own image if it has one (like the poster above). <kbd>Space</kbd> or
+  <kbd>v</kbd> plays and pauses it, and pausing holds the current frame. The
+  presenter view shows the clip too, with a play/pause button and a scrub bar to
+  drag through it.
+- **External** — the plain binaries (and any run with `--software`) show the
+  slide with a ▶ badge, and <kbd>v</kbd> hands the clip to a fullscreen external
+  player: [`mpv`](https://mpv.io) if it's on your `PATH` (recommended),
+  otherwise the OS default opener.
 
 Inline playback decodes via GStreamer, so a `video` build needs the GStreamer
 runtime installed to **build and run** — including for the prebuilt `-video`
-binaries. (Installing with `brew install preso-video` is the exception: it
-declares GStreamer as a dependency, so Homebrew sets it up automatically and
-you can skip this section.) Otherwise, per platform:
+binaries. (Installing with `brew install preso-video`, the `preso-video`
+Debian package or Nix is the exception: each declares GStreamer as a
+dependency, so it's set up automatically and you can skip this section.)
+Otherwise, per platform:
 
 - **macOS** — `brew install gstreamer` (or the official framework from
   [gstreamer.freedesktop.org](https://gstreamer.freedesktop.org/download/)).
   Building from source also needs the dev files and pkg-config:
   `brew install gstreamer pkg-config`.
-- **Linux (Debian/Ubuntu)** — the runtime + plugins:
-  `sudo apt-get install -y gstreamer1.0-plugins-base gstreamer1.0-plugins-good`.
+- **Linux (Debian/Ubuntu)** — the runtime + plugins, including `libav` for
+  H.264/AAC (most `.mp4` clips):
+  `sudo apt-get install -y gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav`.
   Building from source additionally needs
   `libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev`.
 - **Windows** — install the **MSVC runtime** package from
@@ -288,6 +350,7 @@ fn main() {
     println!("highlighted line");
 }
 ```
+*** 
 
 ## Right column
 
@@ -306,7 +369,8 @@ theme.
 | `preso-style` | TOML theme model and the built-in themes |
 | `preso-diagram` | Mermaid / Graphviz / LaTeX-math rendering to images |
 | `preso-export` | PDF and bitmap-PPTX assembly |
-| `preso-app` | The `preso` binary: iced GUI, presenter view, PDF export |
+| `preso-app` | The `preso` binary: iced GUI, presenter view, PDF and PowerPoint export |
+| `preso-convert` | The `preso-convert` binary: Slidev and PowerPoint to preso markdown, and preso to Slidev or editable PowerPoint |
 
 ## License
 

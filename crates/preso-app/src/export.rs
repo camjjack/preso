@@ -185,6 +185,7 @@ fn page_element<'a>(
                 // `overlay::compensated_frame`).
                 scale_factor: 2.0,
                 authoring: false,
+                zoom_from: None,
             },
         )
     };
@@ -214,14 +215,55 @@ fn page_element<'a>(
             // Dither noise defeats the JPEG page compression (~14x
             // larger files); pages keep iced's plain gradient.
             dither: false,
+            // A page standing for the whole slide starts its zoom walk where
+            // its code walk starts (see `SlideContext::code_stage`).
+            zoom: render::SurfaceZoom::at(slide, if at.code_stage.is_some() { 0 } else { at.step }),
         },
     )
+}
+
+/// Test support: render `element` offscreen at `size` (logical) and decode
+/// it to a page, downscaled to `width` pixels wide (`0` keeps the Simulator's
+/// native 2×). The workspace's `.cargo/config.toml` points the Simulator at
+/// the software renderer, as an export run does.
+#[cfg(test)]
+pub(crate) fn offscreen<'a, Message>(
+    element: impl Into<Element<'a, Message>>,
+    size: iced::Size,
+    settings: iced::Settings,
+    theme: &iced::Theme,
+    width: u32,
+) -> preso_export::Page {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+
+    let mut simulator = iced_test::simulator::Simulator::with_size(settings, size, element);
+    let snapshot = simulator.snapshot(theme).expect("snapshot");
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("preso-test-{}-{n}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let page = page_from_snapshot(&snapshot, &dir, 0, width).expect("decode");
+    let _ = std::fs::remove_dir_all(&dir);
+    page
+}
+
+/// Test support: a sampler over `page`'s pixels at (x, y) as fractions of
+/// its size.
+#[cfg(test)]
+pub(crate) fn sampler(page: preso_export::Page) -> impl Fn(f32, f32) -> [u8; 4] {
+    move |x, y| {
+        let px = ((page.width as f32 * x) as usize).min(page.width as usize - 1);
+        let py = ((page.height as f32 * y) as usize).min(page.height as usize - 1);
+        let i = (py * page.width as usize + px) * 4;
+        page.rgba[i..i + 4].try_into().unwrap()
+    }
 }
 
 /// iced_test only exposes snapshot pixels through its PNG side-channel:
 /// `matches_image` writes the PNG when the file is missing. Write it to a
 /// scratch path and decode it back.
-fn page_from_snapshot(
+pub(crate) fn page_from_snapshot(
     snapshot: &iced_test::simulator::Snapshot,
     dir: &Path,
     index: usize,
@@ -264,4 +306,117 @@ fn page_from_snapshot(
         height: image.height(),
         rgba: image.into_raw(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Render the first slide of `source` at reveal `step`, as a page
+    /// downscaled to 960px wide.
+    fn render_step(source: &str, step: usize) -> preso_export::Page {
+        let parsed = preso_core::parser::parse(source).unwrap();
+        let slide = &parsed.slides[0];
+        let media = Media::new(Path::new("deck.md"));
+        let theme = preso_style::Theme::default();
+        let content = markdown::Content::parse(slide.step_source(step));
+        let element = page_element(
+            &content,
+            None,
+            slide,
+            &media,
+            &theme,
+            (1, 1),
+            BuildPoint {
+                step,
+                code_stage: None,
+            },
+        );
+        let settings = iced::Settings {
+            fonts: vec![
+                render::INTER_REGULAR.into(),
+                render::INTER_BOLD.into(),
+                render::JETBRAINS_MONO.into(),
+            ],
+            default_font: render::body_font(&theme),
+            ..iced::Settings::default()
+        };
+        offscreen(
+            element,
+            iced::Size::new(CANVAS_WIDTH, CANVAS_HEIGHT),
+            settings,
+            &render::iced_theme(&theme),
+            960,
+        )
+    }
+
+    /// Pixels that aren't one of the page's two commonest colours (the slide
+    /// and panel backgrounds): roughly, how much ink is on it. Bigger text
+    /// means more.
+    fn ink(page: &preso_export::Page) -> usize {
+        let mut counts = std::collections::HashMap::<[u8; 4], usize>::new();
+        for px in page.rgba.as_chunks::<4>().0 {
+            *counts.entry(*px).or_default() += 1;
+        }
+        let mut by_count: Vec<usize> = counts.into_values().collect();
+        by_count.sort_unstable_by(|a, b| b.cmp(a));
+        by_count.iter().skip(2).sum()
+    }
+
+    #[test]
+    fn a_code_zoom_stage_magnifies_its_lines() {
+        let src = "```rust {all|2 zoom}\nfn a() {}\nlet the_line_to_zoom_onto = 1;\nfn c() {}\nfn d() {}\n```\n";
+        let whole = render_step(src, 0);
+        let zoomed = render_step(src, 1);
+        assert_ne!(whole.rgba, zoomed.rgba, "the zoom stage changes the page");
+        // One line at ~2× carries more ink than four at 1×.
+        assert!(
+            ink(&zoomed) > ink(&whole),
+            "{} vs {}",
+            ink(&zoomed),
+            ink(&whole)
+        );
+    }
+
+    #[test]
+    fn a_slide_zoom_magnifies_the_content() {
+        let src = "# A heading to zoom onto\n\nSome body text below it.\n\n<!-- zoom[1]: 25%,15%,2x -->\n";
+        let whole = render_step(src, 0);
+        let zoomed = render_step(src, 1);
+        assert!(
+            ink(&zoomed) > ink(&whole),
+            "{} vs {}",
+            ink(&zoomed),
+            ink(&whole)
+        );
+    }
+
+    /// Whether a page has any of a Mermaid diagram's node-outline blue-grey
+    /// on it — i.e. the diagram drew, not just the card behind it.
+    fn has_diagram_strokes(page: &preso_export::Page) -> bool {
+        page.rgba.as_chunks::<4>().0.iter().any(|p| {
+            let (r, g, b) = (i32::from(p[0]), i32::from(p[1]), i32::from(p[2]));
+            (90..=180).contains(&r) && b - r > 15 && (g - r).abs() < 40
+        })
+    }
+
+    #[test]
+    fn tests_render_like_an_export() {
+        // Under wgpu, a raster this size (over its 2 MiB synchronous-upload
+        // limit) is missing from a one-shot snapshot; the software renderer
+        // an export uses draws it. Guards the `.cargo/config.toml` setting.
+        let src = "```mermaid {width=100%}\ngraph LR\n  a[Parse] --> b[Layout] --> c[Paint]\n```\n";
+        assert!(has_diagram_strokes(&render_step(src, 0)));
+    }
+
+    #[test]
+    fn a_diagram_zoom_stage_changes_the_view() {
+        let src =
+            "```mermaid {all|Layout zoom}\ngraph LR\n  a[Parse] --> b[Layout] --> c[Paint]\n```\n";
+        let whole = render_step(src, 0);
+        let zoomed = render_step(src, 1);
+        assert_ne!(whole.rgba, zoomed.rgba);
+        // Zoomed, it's drawn from a deeper raster — which must still draw.
+        assert!(has_diagram_strokes(&whole) && has_diagram_strokes(&zoomed));
+    }
 }

@@ -11,8 +11,10 @@
 #   --skip-video   skip the `--features video` variant (it needs the
 #                  GStreamer development libraries to build)
 #
-# Artifacts land in dist/. Collect every machine's dist/ together, then
-# create the release from any of them:
+# Artifacts land in dist/. With Node (`npx`) available, the VS Code
+# extension is packaged too — it's the same on every OS, so one machine's
+# copy is enough. Collect every machine's dist/ together, then create the
+# release from any of them:
 #   gh release create <tag> --draft --generate-notes dist/*
 # (or upload through the GitHub web UI). Linux additionally produces the
 # preso/preso-video .debs (requires cargo-deb).
@@ -44,7 +46,7 @@ package() {
   local bin="target/release"
   rm -rf "$name"
   mkdir "$name"
-  cp "$bin/preso$exe" "$name/"
+  cp "$bin/preso$exe" "$bin/preso-lsp$exe" "$name/"
   [ "$with_convert" = yes ] && cp "$bin/preso-convert$exe" "$name/"
   # No CHANGELOG.md: it's private-only and absent from the public repo.
   cp README.md LICENSE-MIT LICENSE-APACHE "$name/"
@@ -59,7 +61,7 @@ package() {
 }
 
 echo "==> Standard build ($host)"
-cargo build --release --bin preso --bin preso-convert
+cargo build --release --bin preso --bin preso-convert --bin preso-lsp
 package "" yes
 
 if [ "$skip_video" = 0 ]; then
@@ -79,6 +81,23 @@ case "$host" in
     cp target/debian/*.deb dist/
     ;;
 esac
+
+# The VS Code extension, versioned to the tag (as release.yml builds it).
+if command -v npx >/dev/null; then
+  echo "==> VS Code extension"
+  (
+    cd editors/vscode
+    npm ci --silent
+    cp package.json package.json.orig
+    npm version "${tag#v}" --no-git-tag-version --allow-same-version >/dev/null
+    cp ../../LICENSE-MIT ../../LICENSE-APACHE .
+    npx --yes @vscode/vsce@3 package --skip-license --out "../../dist/preso-vscode-${tag}.vsix"
+    rm LICENSE-MIT LICENSE-APACHE
+    mv package.json.orig package.json
+  )
+else
+  echo "==> Skipping the VS Code extension (needs Node's npx)"
+fi
 
 echo "==> Done. Artifacts in dist/:"
 ls -l dist/

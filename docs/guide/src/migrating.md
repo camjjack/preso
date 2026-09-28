@@ -48,9 +48,10 @@ A few mappings are approximate and worth checking afterwards:
 - A Slidev **theme** is an npm package; only `dark`/`light` carry over, anything
   else falls back to the default theme (with a warning) — pick or write a preso
   theme instead.
-- **Transitions** map to preso's set: `fade`/`fade-out` → fade, directional
-  `slide-*` → a [wipe](appendix/rendering.md#transitions); anything else falls
-  back to fade (with a warning).
+- **Transitions** map to preso's set: `fade`/`fade-out` → fade, and the
+  directional `slide-left` / `-right` / `-up` / `-down` carry over as preso
+  [pans](appendix/rendering.md#transitions) in the same direction; anything
+  else falls back to fade (with a warning).
 - **Image layouts** are approximated as two-column slides.
 
 ## From PowerPoint

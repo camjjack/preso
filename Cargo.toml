@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.2.2"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
@@ -19,7 +19,7 @@ preso-export = { path = "crates/preso-export" }
 # GUI
 # `image-without-codecs` lets the shared `image` crate (see
 # below) decide which codecs to compile instead of pulling all of them.
-iced = { version = "0.14", default-features = false, features = ["tiny-skia", "crisp", "web-colors", "thread-pool", "linux-theme-detection", "x11", "wayland", "markdown", "highlighter", "image-without-codecs", "canvas"] }
+iced = { version = "0.14", default-features = false, features = ["tiny-skia", "crisp", "web-colors", "thread-pool", "linux-theme-detection", "x11", "wayland", "markdown", "highlighter", "image-without-codecs", "canvas", "advanced"] }
 
 # App plumbing
 clap = { version = "4.5", features = ["derive"] }

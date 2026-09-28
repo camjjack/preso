@@ -2,9 +2,10 @@ use crate::error::ParseError;
 use crate::fence;
 use crate::model::{
     Anchor, CodeBlock, Frontmatter, Highlight, HighlightMode, HighlightShape, ImageRef, ImageRow,
-    ImageText, ImageTextRun, LayerImage, Layout, MathBlock, Note, Slide, SlideOverrides, Table,
-    TableAlign,
+    ImageText, ImageTextRun, LayerImage, Layout, MathBlock, Note, Slide, SlideOverrides, SlideZoom,
+    Table, TableAlign, ZoomFocus,
 };
+use std::ops::Range;
 
 /// Result of parsing a deck source file.
 #[derive(Debug, Clone, PartialEq)]
@@ -45,36 +46,37 @@ pub fn parse(source: &str) -> Result<ParsedDeck, ParseError> {
 /// Extract frontmatter if the first line is `---`.
 /// Returns the parsed frontmatter and the 0-based line index where the
 /// slide body begins.
-fn extract_frontmatter(source: &str) -> Result<(Frontmatter, usize), ParseError> {
-    let mut lines = source.lines();
-    let Some(first) = lines.next() else {
+pub(crate) fn extract_frontmatter(source: &str) -> Result<(Frontmatter, usize), ParseError> {
+    let Some((yaml_lines, body_start)) = frontmatter_span(source) else {
         return Ok((Frontmatter::default(), 0));
     };
-    if first.trim_end() != "---" {
-        return Ok((Frontmatter::default(), 0));
-    }
-
     let mut yaml = String::new();
-    for (i, line) in lines.enumerate() {
-        let trimmed = line.trim_end();
-        if trimmed == "---" || trimmed == "..." {
-            let fm = if yaml.trim().is_empty() {
-                Frontmatter::default()
-            } else {
-                serde_norway::from_str(&yaml)?
-            };
-            // body begins after the closing delimiter: line 0 is `---`,
-            // lines 1..=i are yaml, line i+1 is the closer
-            return Ok((fm, i + 2));
-        }
+    for line in source.lines().skip(yaml_lines.start).take(yaml_lines.len()) {
         yaml.push_str(line);
         yaml.push('\n');
     }
+    let fm = if yaml.trim().is_empty() {
+        Frontmatter::default()
+    } else {
+        serde_norway::from_str(&yaml)?
+    };
+    Ok((fm, body_start))
+}
 
-    // A file that *opens* with `---` but never closes it is treated as a
-    // deck whose first slide starts with a delimiter, not as an error:
-    // this is what an author mid-edit most likely means.
-    Ok((Frontmatter::default(), 0))
+/// Where a closed YAML frontmatter block sits: the 0-based range of its YAML
+/// lines (delimiters excluded) and the line the slide body begins on. `None`
+/// when the file doesn't open with `---` or never closes it — a file that
+/// *opens* with `---` but never closes it is treated as a deck whose first
+/// slide starts with a delimiter, not as an error: this is what an author
+/// mid-edit most likely means.
+pub(crate) fn frontmatter_span(source: &str) -> Option<(Range<usize>, usize)> {
+    let mut lines = source.lines();
+    if lines.next()?.trim_end() != "---" {
+        return None;
+    }
+    // Line 0 is `---`, lines 1..=i are YAML, line i+1 is the closer.
+    let close = lines.position(|line| matches!(line.trim_end(), "---" | "..."))? + 1;
+    Some((1..close, close + 1))
 }
 
 /// A deck split into its raw pieces: typed frontmatter plus each slide's
@@ -97,23 +99,22 @@ struct RawSlide {
 
 /// Split the body (starting at `body_start`, 0-based line index) into slides.
 fn split_slides(source: &str, body_start: usize) -> Vec<RawSlide> {
-    let mut slides = Vec::new();
-    let mut current = String::new();
-    // 1-based line where the current slide began
-    let mut current_start = body_start + 1;
-    // Fence tracking so `---` inside a fenced code block is ignored.
-    let mut fence = fence::Tracker::default();
-
-    for (i, line) in source.lines().enumerate().skip(body_start) {
-        if !fence.process(line) && line.trim_end() == "---" {
-            push_raw(&mut slides, &mut current, current_start);
-            current_start = i + 2; // next line, 1-based
-        } else {
-            current.push_str(line);
-            current.push('\n');
-        }
-    }
-    push_raw(&mut slides, &mut current, current_start);
+    let lines: Vec<&str> = source.lines().collect();
+    let mut slides: Vec<RawSlide> = segments(source, body_start)
+        .into_iter()
+        .filter_map(|range| {
+            let mut text = String::new();
+            for line in &lines[range.clone()] {
+                text.push_str(line);
+                text.push('\n');
+            }
+            // Drop empty segments produced by leading/consecutive delimiters.
+            (!text.trim().is_empty()).then(|| RawSlide {
+                source: text,
+                start_line: range.start + 1,
+            })
+        })
+        .collect();
 
     // An entirely empty file still yields one (empty) slide so the app
     // always has something to display during hot reload of a new file.
@@ -126,16 +127,37 @@ fn split_slides(source: &str, body_start: usize) -> Vec<RawSlide> {
     slides
 }
 
-fn push_raw(slides: &mut Vec<RawSlide>, current: &mut String, start_line: usize) {
-    let source = std::mem::take(current);
-    // Drop empty segments produced by leading/consecutive delimiters.
-    if !source.trim().is_empty() {
-        slides.push(RawSlide { source, start_line });
+/// 0-based lines holding a `---` slide delimiter: a line that is exactly
+/// `---` (trailing whitespace allowed) at or after `body_start`, outside
+/// fenced code blocks.
+pub(crate) fn delimiter_lines(source: &str, body_start: usize) -> Vec<usize> {
+    let mut fence = fence::Tracker::default();
+    source
+        .lines()
+        .enumerate()
+        .skip(body_start)
+        .filter(|(_, line)| !fence.process(line) && line.trim_end() == "---")
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// The body's line ranges between delimiters, in order — one per slide
+/// position, *including* empty ones between consecutive delimiters (which
+/// [`split_slides`] drops). Delimiter lines belong to no segment.
+pub(crate) fn segments(source: &str, body_start: usize) -> Vec<Range<usize>> {
+    let line_count = source.lines().count();
+    let mut out = Vec::new();
+    let mut start = body_start.min(line_count);
+    for delimiter in delimiter_lines(source, body_start) {
+        out.push(start..delimiter);
+        start = delimiter + 1;
     }
+    out.push(start..line_count);
+    out
 }
 
 /// Extract notes and reveal steps from a raw slide source.
-fn process_slide(raw: &str, start_line: usize) -> Slide {
+pub(crate) fn process_slide(raw: &str, start_line: usize) -> Slide {
     // Content chunks between pause markers; chunks[i] is what step i *adds*.
     let mut chunks: Vec<String> = vec![String::new()];
     let mut notes: Vec<Note> = Vec::new();
@@ -145,6 +167,7 @@ fn process_slide(raw: &str, start_line: usize) -> Slide {
     let mut image_rows: Vec<ImageRow> = Vec::new();
     let mut image_texts: Vec<ImageTextRun> = Vec::new();
     let mut layer_images: Vec<LayerImage> = Vec::new();
+    let mut zooms: Vec<SlideZoom> = Vec::new();
     let mut highlights: Vec<Vec<Highlight>> = Vec::new();
     // Set by `<!-- highlight: … -->`, attached to the next image line.
     let mut pending_highlights: Vec<Highlight> = Vec::new();
@@ -304,6 +327,15 @@ fn process_slide(raw: &str, start_line: usize) -> Slide {
         if let Some((step, spec)) = highlight_directive(trimmed) {
             if let Some(h) = parse_highlight(step, spec) {
                 pending_highlights.push(h);
+            }
+            continue;
+        }
+        // Slide zoom: `<!-- zoom[n]: 40%,20%,2x -->` magnifies the slide's
+        // content from step n (`all` shows it whole again). A malformed one
+        // is dropped rather than zooming somewhere unintended.
+        if let Some((step, spec)) = zoom_directive(trimmed) {
+            if let Some(focus) = parse_zoom(spec) {
+                zooms.push(SlideZoom { step, focus });
             }
             continue;
         }
@@ -511,13 +543,14 @@ fn process_slide(raw: &str, start_line: usize) -> Slide {
         highlights,
         layout,
         overrides,
+        zooms,
     }
 }
 
 /// Parse a `<!-- image: path position=center width=60 opacity=0.5 padding=40 -->`
 /// spec (the part between `image:` and `-->`). The first token is the path;
 /// the rest are `key=value`. `None` if there's no path.
-fn parse_layer_image(spec: &str) -> Option<LayerImage> {
+pub(crate) fn parse_layer_image(spec: &str) -> Option<LayerImage> {
     let mut tokens = spec.split_whitespace();
     let path = tokens.next()?.to_string();
     let mut image = LayerImage {
@@ -583,6 +616,57 @@ pub fn highlight_directive(trimmed: &str) -> Option<(Option<usize>, &str)> {
     Some((step, rest.strip_suffix("-->")?))
 }
 
+/// Recognize `<!-- zoom: … -->` / `<!-- zoom[n]: … -->` (step-gated like
+/// `highlight[n]`), returning the step and the spec text. Public because
+/// directives are a format contract shared with exporters.
+pub fn zoom_directive(trimmed: &str) -> Option<(Option<usize>, &str)> {
+    let body = trimmed.strip_prefix("<!--")?.trim_start();
+    let (step, rest) = if let Some(rest) = body.strip_prefix("zoom:") {
+        (None, rest)
+    } else {
+        let rest = body.strip_prefix("zoom[")?;
+        let close = rest.find("]:")?;
+        let n: usize = rest[..close].trim().parse().ok()?;
+        (Some(n), &rest[close + 2..])
+    };
+    Some((step, rest.strip_suffix("-->")?))
+}
+
+/// Parse a slide zoom spec: `40%,20%,2x` — the centre point as percentages
+/// of the slide (`%` optional) and the magnification (`x` optional) — or
+/// `all` for the whole slide (`Some(None)`). `None` when malformed, or when
+/// the point is off the slide or the magnification below 1 (a zoom *out*
+/// would show past the slide's edges).
+pub(crate) fn parse_zoom(spec: &str) -> Option<Option<ZoomFocus>> {
+    let spec = spec.trim();
+    if spec == "all" {
+        return Some(None);
+    }
+    let parts: Vec<&str> = spec
+        .split([',', ' '])
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .collect();
+    let [x, y, scale] = parts.as_slice() else {
+        return None;
+    };
+    let pct = |v: &str| -> Option<f32> {
+        let n: f32 = v.strip_suffix('%').unwrap_or(v).trim().parse().ok()?;
+        (0.0..=100.0).contains(&n).then_some(n / 100.0)
+    };
+    let scale: f32 = scale
+        .strip_suffix('x')
+        .unwrap_or(scale)
+        .trim()
+        .parse()
+        .ok()?;
+    (scale >= 1.0 && scale.is_finite()).then_some(Some(ZoomFocus {
+        x: pct(x)?,
+        y: pct(y)?,
+        scale,
+    }))
+}
+
 /// Parse a highlight spec: `rect x=10% y=20% w=30% h=15% color=#ffd54a
 /// opacity=0.35 stroke=3`. The first token is the shape (`rect`, `ellipse`,
 /// or `circle`); coordinates are percentages of the image size (`%`
@@ -593,7 +677,7 @@ pub fn highlight_directive(trimmed: &str) -> Option<(Option<usize>, &str)> {
 /// (leaving a transparent image's background untouched). `None` on a
 /// malformed value or without a positive `w`/`h`, so a broken spec drops
 /// the shape instead of drawing it somewhere wrong.
-fn parse_highlight(step: Option<usize>, spec: &str) -> Option<Highlight> {
+pub(crate) fn parse_highlight(step: Option<usize>, spec: &str) -> Option<Highlight> {
     let mut tokens = spec.split_whitespace();
     let shape = match tokens.next()? {
         "rect" => HighlightShape::Rect,
@@ -688,7 +772,7 @@ fn parse_anchor(s: &str) -> Anchor {
 /// Whether a line is a single standalone image — `![alt](url)`, optionally
 /// with a `{…}` attribute group. (Exactly one `](`, so two images on one
 /// line aren't mistaken for one.)
-fn is_image_line(line: &str) -> bool {
+pub(crate) fn is_image_line(line: &str) -> bool {
     let t = line.trim();
     t.starts_with("![") && t.matches("](").count() == 1 && (t.ends_with(')') || t.ends_with('}'))
 }
@@ -697,7 +781,7 @@ fn is_image_line(line: &str) -> bool {
 /// space after — and the content that follows. `None` for anything that
 /// isn't a list item. Nested items keep their indent in the marker, so
 /// putting it back in front of a replacement keeps the nesting.
-fn bullet_split(line: &str) -> Option<(&str, &str)> {
+pub(crate) fn bullet_split(line: &str) -> Option<(&str, &str)> {
     let indent = line.len() - line.trim_start().len();
     let rest = &line[indent..];
     let marker = if let Some(m) = ["- ", "* ", "+ "].iter().find(|m| rest.starts_with(**m)) {
@@ -864,7 +948,7 @@ fn top_level_bullet(line: &str) -> bool {
 /// empty cells produced by the optional leading/trailing pipes. `\|` is an
 /// escaped pipe (GFM): it becomes a literal `|` inside the cell rather than a
 /// column separator — needed even within a `` `code` `` span.
-fn table_cells(line: &str) -> Vec<String> {
+pub(crate) fn table_cells(line: &str) -> Vec<String> {
     let mut cells = Vec::new();
     let mut cur = String::new();
     let mut chars = line.trim().chars().peekable();
@@ -894,7 +978,7 @@ fn table_cells(line: &str) -> Vec<String> {
 /// If `line` is a GFM table delimiter (`|---|:--:|---:|`), return the
 /// per-column alignment; otherwise `None`. Requires a pipe so a bare `---`
 /// (never present inside a slide anyway) can't be mistaken for one.
-fn table_delimiter(line: &str) -> Option<Vec<TableAlign>> {
+pub(crate) fn table_delimiter(line: &str) -> Option<Vec<TableAlign>> {
     if !line.contains('|') {
         return None;
     }
@@ -920,7 +1004,7 @@ fn table_delimiter(line: &str) -> Option<Vec<TableAlign>> {
 }
 
 /// A line that can be a table body row: non-blank and containing a pipe.
-fn is_table_row(line: &str) -> bool {
+pub(crate) fn is_table_row(line: &str) -> bool {
     let t = line.trim();
     !t.is_empty() && t.contains('|')
 }
@@ -962,7 +1046,7 @@ fn parse_layout(spec: &str) -> Layout {
 
 /// `"2:1"` / `"60/40"` → `(2, 1)` / `(60, 40)`. Both parts must be
 /// positive integers, else `None` (and the ratio falls back to 1:1).
-fn parse_ratio(s: &str) -> Option<(u16, u16)> {
+pub(crate) fn parse_ratio(s: &str) -> Option<(u16, u16)> {
     let (a, b) = s.split_once([':', '/'])?;
     let a: u16 = a.trim().parse().ok().filter(|&n| n > 0)?;
     let b: u16 = b.trim().parse().ok().filter(|&n| n > 0)?;
@@ -1019,7 +1103,7 @@ fn rewrite_image_attrs(line: &str) -> String {
 
 /// `width=30% border shadow` → `width:30+border+shadow`; `None` if any
 /// token is unrecognized (the group is then left as literal text).
-fn encode_image_attrs(spec: &str) -> Option<String> {
+pub(crate) fn encode_image_attrs(spec: &str) -> Option<String> {
     let mut encoded: Vec<String> = Vec::new();
     for token in spec.split_whitespace() {
         if let Some(value) = token.strip_prefix("width=") {
@@ -1239,7 +1323,7 @@ pub fn parse_note_open(trimmed: &str) -> Option<NoteOpen> {
 /// so a fence can carry one without the other: an unlabelled fence annotated
 /// `{align=right}` is a right-aligned block, not a block whose *language* is
 /// `{align=right}`.
-fn clean_fence_line(line: &str) -> (String, CodeBlock) {
+pub(crate) fn clean_fence_line(line: &str) -> (String, CodeBlock) {
     let indent_len = line.len() - line.trim_start_matches(' ').len();
     let (indent, rest) = line.split_at(indent_len);
     let fence_ch = rest.chars().next().expect("caller verified fence");
@@ -1737,6 +1821,23 @@ mod tests {
     }
 
     #[test]
+    fn columns_hold_their_shape_before_the_split_is_revealed() {
+        let src =
+            "<!-- layout: TwoColumn -->\n- a\n<!-- pause -->\n- b\n***\n<!-- pause -->\n- c\n";
+        let slide = &parse(src).unwrap().slides[0];
+        assert_eq!(slide.steps.len(), 3);
+        let (left, right) = slide.columns_at(0).unwrap();
+        assert_eq!((left.trim(), right.as_str()), ("- a", ""));
+        let (left, right) = slide.columns_at(2).unwrap();
+        assert_eq!((left.trim(), right.trim()), ("- a\n- b", "- c"));
+        // Without a separator anywhere, still no columns.
+        let plain = &parse("<!-- layout: TwoColumn -->\n- a\n<!-- pause -->\n- b\n")
+            .unwrap()
+            .slides[0];
+        assert!(plain.columns_at(0).is_none());
+    }
+
+    #[test]
     fn default_layout_has_no_columns() {
         let deck = parse("just text\n\n***\n\nmore\n").unwrap();
         assert_eq!(deck.slides[0].layout, crate::model::Layout::Content);
@@ -1822,6 +1923,49 @@ mod tests {
         );
         // The directive is chrome, not body content.
         assert!(!slide.source.contains("footnote"));
+    }
+
+    #[test]
+    fn slide_zoom_directives_are_step_gated() {
+        let src =
+            "# x\n<!-- zoom[1]: 40%,20%,2x -->\n<!-- zoom[2]: 75 60 3 -->\n<!-- zoom[3]: all -->\n";
+        let slide = &parse(src).unwrap().slides[0];
+        // The directives are stripped from the body and mint their steps.
+        assert!(!slide.source.contains("zoom"));
+        assert_eq!(slide.step_count(), 4);
+        assert!(slide.has_zoom());
+
+        assert_eq!(slide.zoom_at(0), None);
+        let first = ZoomFocus {
+            x: 0.4,
+            y: 0.2,
+            scale: 2.0,
+        };
+        assert_eq!(slide.zoom_at(1), Some(first));
+        // `%` and `x` are optional, as are the commas.
+        let second = slide.zoom_at(2).unwrap();
+        assert_eq!((second.x, second.y, second.scale), (0.75, 0.6, 3.0));
+        // `all` zooms back out, and that holds past the last step.
+        assert_eq!(slide.zoom_at(3), None);
+        assert_eq!(slide.zoom_at(9), None);
+    }
+
+    #[test]
+    fn ungated_slide_zoom_applies_from_the_start() {
+        let slide = &parse("<!-- zoom: 50%,50%,1.5x -->\n# x\n").unwrap().slides[0];
+        assert_eq!(slide.zoom_at(0).map(|z| z.scale), Some(1.5));
+        assert_eq!(slide.step_count(), 1);
+    }
+
+    #[test]
+    fn malformed_slide_zoom_is_dropped() {
+        for spec in ["40%,20%", "140%,20%,2x", "40%,20%,0.5x", "a,b,c", ""] {
+            let src = format!("# x\n<!-- zoom[1]: {spec} -->\n");
+            let slide = &parse(&src).unwrap().slides[0];
+            assert!(slide.zooms.is_empty(), "{spec:?} should be dropped");
+            assert!(!slide.source.contains("zoom"), "still stripped: {spec:?}");
+        }
+        assert!(!parse("# x\n").unwrap().slides[0].has_zoom());
     }
 
     #[test]
@@ -2584,57 +2728,93 @@ mod tests {
             deck.frontmatter.title.as_deref(),
             Some("Preso: Native Markdown Presentations")
         );
-        assert_eq!(deck.slides.len(), 15);
+        assert_eq!(deck.slides.len(), 19);
+
+        // Slides are found by heading, so adding one to the deck doesn't
+        // shift every check after it.
+        let slide = |heading: &str| {
+            deck.slides
+                .iter()
+                .find(|s| {
+                    s.source
+                        .lines()
+                        .any(|l| l.trim_start_matches('#').trim() == heading)
+                })
+                .unwrap_or_else(|| panic!("no slide headed {heading:?}"))
+        };
 
         // Full-bleed background slide: `background=` is an image path.
-        let bg = &deck.slides[13];
         assert_eq!(
-            bg.overrides.background.as_deref(),
+            slide("Full-Bleed Backgrounds")
+                .overrides
+                .background
+                .as_deref(),
             Some("assets/backdrop.png")
         );
 
-        // Slide 1 is the title slide; slide 7 a section header.
+        // The first slide is the title slide; "Rich Content" a section header.
         assert_eq!(deck.slides[0].overrides.kind.as_deref(), Some("title"));
-        assert_eq!(deck.slides[5].overrides.kind.as_deref(), Some("section"));
+        assert_eq!(
+            slide("Rich Content").overrides.kind.as_deref(),
+            Some("section")
+        );
 
-        // Slide 2 ("Why Another Tool?") has 3 steps and a step note
-        let why = &deck.slides[1];
+        // "Why Another Tool?" has 3 steps and a step note
+        let why = slide("Why Another Tool?");
         assert_eq!(why.step_count(), 3);
         assert!(why.notes.iter().any(|n| n.step == Some(2)));
 
         // Two-column slides: one-sided heading (left only) then matching
         // headings on both sides.
-        let (one_left, one_right) = deck.slides[3].columns_at(0).unwrap();
+        let one = slide("The Problem, and why a native binary answers it");
+        let (one_left, one_right) = one.columns_at(0).unwrap();
         assert_eq!(crate::model::leading_heading_level(&one_left), Some(2));
         assert_eq!(crate::model::leading_heading_level(&one_right), None);
-        let (both_left, both_right) = deck.slides[4].columns_at(0).unwrap();
+        let (both_left, both_right) = slide("Before").columns_at(0).unwrap();
         assert_eq!(crate::model::leading_heading_level(&both_left), Some(3));
         assert_eq!(crate::model::leading_heading_level(&both_right), Some(3));
 
         // The transparent-diagram slides carry the fence flag
-        let transparent = &deck.slides[7];
-        assert!(transparent.source.contains("Transparent"));
+        let transparent = slide("Transparent Diagrams");
         assert!(transparent.code_blocks[0].transparent_background());
         assert_eq!(transparent.code_blocks[0].width_percent(), Some(55.0));
 
         // The Graphviz slide carries a sized dot fence
-        let dot = &deck.slides[9];
-        assert!(dot.source.contains("Graphviz"));
+        let dot = slide("Graphviz Too");
         assert_eq!(dot.code_blocks[0].language.as_deref(), Some("dot"));
         assert_eq!(dot.code_blocks[0].width_percent(), Some(45.0));
 
         // The "Tables" slide carries an extracted table with 3 columns.
-        let tables = &deck.slides[11];
+        let tables = slide("Tables");
         assert!(tables.source.contains("preso-table:0"));
         assert_eq!(tables.tables[0].headers.len(), 3);
 
         // The "Edge Cases" slide keeps its in-fence `---`
-        let edge = &deck.slides[12];
-        assert!(edge.source.contains("Edge Cases"));
+        let edge = slide("Edge Cases Live Here");
         assert!(edge.source.contains("---"));
 
+        // The zoom slides: a code block and a diagram whose stages zoom, and
+        // a slide zoom in and back out.
+        let code = &slide("Zooming Into Code").code_blocks[0];
+        assert_eq!(code.zoom_lines_at(1), Some((2, 2)));
+        let diagram = &slide("Zooming Into Diagrams").code_blocks[0];
+        assert_eq!(
+            diagram.zoom_labels_at(1),
+            Some(vec!["Layout Engine".to_string()])
+        );
+        let anything = slide("Zooming Into Anything");
+        assert!(anything.zoom_at(1).is_some());
+        assert_eq!(anything.zoom_at(2), None);
+
+        // The showcase video's slide.
+        assert!(
+            deck.slides
+                .iter()
+                .any(|s| s.video.as_deref() == Some("showcase.mp4"))
+        );
+
         // Final slide has a slide-level note
-        assert!(!deck.slides[14].notes.is_empty());
+        assert!(!deck.slides.last().unwrap().notes.is_empty());
     }
 }
 

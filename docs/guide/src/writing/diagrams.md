@@ -48,3 +48,27 @@ flowchart TD
 ````
 
 The two compose: `{width=60% transparent}` does both.
+
+## Zooming onto nodes
+
+Like a code block's [line zoom](code.md#zooming-onto-lines), a `zoom` flag
+turns the annotation's `|`-separated stages into zoom targets — here, the
+**labels** of the nodes to zoom onto:
+
+````markdown
+```mermaid {width=100% all|Layout|Read, Parse zoom}
+graph LR
+    a[Read] --> b[Parse] --> c[Layout] --> d[Paint]
+```
+````
+
+That opens on the whole diagram, zooms onto the `Layout` node, then pans out
+to fit `Read` and `Parse` together (commas zoom onto several nodes at once).
+Labels match case-insensitively; a subgraph's title zooms onto the whole
+subgraph. A label that matches nothing leaves the diagram whole. A zooming
+diagram is rasterized at extra depth so it stays sharp as it zooms (up to 4×);
+a very large one — a full-width diagram, say — gets less, so it can soften a
+little at its deepest zoom.
+
+As with code, the zooming diagram claims the rest of the slide below it as
+room to zoom into.

@@ -7,6 +7,7 @@
 - [Installation](getting-started/installation.md)
 - [Your First Deck](getting-started/first-deck.md)
 - [Presenting](getting-started/presenting.md)
+- [Editor Support](getting-started/editor-support.md)
 
 # Writing Decks
 

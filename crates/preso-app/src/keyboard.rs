@@ -33,6 +33,9 @@ pub enum Action {
     /// `V`: play the current slide's `<!-- video: … -->` clip in an external
     /// fullscreen player.
     PlayVideo,
+    /// `,` / `.`: pause the current slide's inline clip and step a frame
+    /// back (`-1`) or on (`1`).
+    StepVideo(i32),
     /// `N`: switch the presenter window to its next layout.
     CyclePresenterLayout,
     /// Overview grid is open: scroll it to the top / bottom / by a page.
@@ -139,6 +142,14 @@ pub fn action(event: &Event, jump_buffer: &mut String, overview: bool) -> Option
         Key::Character("n") => {
             jump_buffer.clear();
             Some(Action::CyclePresenterLayout)
+        }
+        Key::Character(",") => {
+            jump_buffer.clear();
+            Some(Action::StepVideo(-1))
+        }
+        Key::Character(".") => {
+            jump_buffer.clear();
+            Some(Action::StepVideo(1))
         }
         Key::Character(c) if c.chars().all(|c| c.is_ascii_digit()) => {
             jump_buffer.push_str(c);

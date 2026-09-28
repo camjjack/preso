@@ -40,19 +40,22 @@ Download the archive for your platform from the
 | Linux (x86_64) | `preso-<version>-x86_64-unknown-linux-gnu.tar.gz` |
 | Windows (x86_64) | `preso-<version>-x86_64-pc-windows-msvc.zip` |
 
-Unpack it and put the `preso` binary somewhere on your `PATH`:
+Unpack it and put the binaries somewhere on your `PATH`. Besides `preso`,
+the archive holds `preso-lsp`, the language server for
+[editor support](editor-support.md), and (in the standard archives)
+`preso-convert`, the [importer](../migrating.md):
 
 ```sh
 tar xzf preso-*-aarch64-apple-darwin.tar.gz
-sudo mv preso-*/preso /usr/local/bin/
+sudo mv preso-*/preso preso-*/preso-lsp /usr/local/bin/
 preso --version
 ```
 
 > 💡 **macOS Gatekeeper.** These manually-downloaded binaries aren't notarized,
 > so the first launch may be blocked. Right-click the binary → **Open**, or
 > clear the quarantine flag with
-> `xattr -d com.apple.quarantine /usr/local/bin/preso`. (A Homebrew install
-> avoids this — see above.)
+> `xattr -d com.apple.quarantine /usr/local/bin/preso /usr/local/bin/preso-lsp`.
+> (A Homebrew install avoids this — see above.)
 
 ## Build from source
 
@@ -87,4 +90,6 @@ packages.
 preso --version
 ```
 
-Then head to **[Your First Deck](first-deck.md)**.
+Then head to **[Your First Deck](first-deck.md)**. To make your editor
+preso-aware, see **[Editor Support](editor-support.md)**; every install
+route above includes the language server it needs.

@@ -1,0 +1,15 @@
+[package]
+name = "zed-preso"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Built by Zed (to wasm32-wasip2), not as part of the preso workspace.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+zed_extension_api = "0.7"

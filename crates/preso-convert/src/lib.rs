@@ -131,13 +131,14 @@ fn deck_frontmatter(headmatter: &Mapping, warnings: &mut Vec<String>) -> String 
     }
 
     if let Some(transition) = headmatter.get("transition").and_then(as_string) {
-        // Map Slidev's transition names onto preso's set (fade | wipe | none).
-        // Slidev's directional `slide-*` become a wipe (preso has no transforms
-        // for true sliding); anything without an equivalent falls back to fade.
+        // Map Slidev's transition names onto preso's set. Its directional
+        // `slide-*` names are preso's too (pans, keeping their direction);
+        // anything without an equivalent falls back to fade.
         let preso = match transition.as_str() {
             "none" => "none",
             "fade" | "fade-out" => "fade",
-            t if t.starts_with("slide") => "slide", // preso renders as a wipe
+            t @ ("slide-left" | "slide-right" | "slide-up" | "slide-down") => t,
+            t if t.starts_with("slide") => "slide",
             _ => "fade",
         };
         lines.push(format!("transition: {preso}"));
@@ -249,10 +250,12 @@ right content
 
     #[test]
     fn transition_maps_to_preso_set() {
-        // Directional slide-* → wipe, no warning.
-        let r = convert("---\ntransition: slide-left\n---\n\n# A\n");
-        assert!(r.output.contains("transition: slide"));
-        assert!(!r.warnings.iter().any(|w| w.contains("transition")));
+        // Directional slide-* pass through (preso pans that way), no warning.
+        for name in ["slide-left", "slide-up"] {
+            let r = convert(&format!("---\ntransition: {name}\n---\n\n# A\n"));
+            assert!(r.output.contains(&format!("transition: {name}")), "{name}");
+            assert!(!r.warnings.iter().any(|w| w.contains("transition")));
+        }
 
         // fade passes through unchanged.
         assert!(

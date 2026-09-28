@@ -52,9 +52,10 @@
             src = self;
             cargoLock.lockFile = ./Cargo.lock;
 
-            # The app with inline video, plus the importer. The feature is
-            # namespaced because two -p selections are built at once.
-            cargoBuildFlags = [ "-p" "preso-app" "-p" "preso-convert" ];
+            # The app with inline video, the importer, and the preso-lsp
+            # language server the editor extensions launch. The feature is
+            # namespaced because several -p selections are built at once.
+            cargoBuildFlags = [ "-p" "preso-app" "-p" "preso-convert" "-p" "preso-lsp" ];
             buildFeatures = [ "preso-app/video" ];
 
             # The full suite runs in repo CI; skipping it here avoids

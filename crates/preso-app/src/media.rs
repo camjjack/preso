@@ -14,6 +14,15 @@ use std::path::PathBuf;
 
 /// Supersampling factor for rasterized vector content (crisp on hidpi).
 const OVERSAMPLE: f32 = 2.0;
+/// (language, source, transparent, labels) of a [`Media::diagram_region`].
+type RegionKey = (String, String, bool, Vec<String>);
+
+/// Longest side, in pixels, a zoomable diagram is rasterized to: within
+/// every GPU's texture limit.
+const MAX_RASTER_SIDE: f32 = 8192.0;
+/// Most pixels a zoomable diagram is rasterized to (64 MB of RGBA), so a
+/// large square diagram's deep raster stays affordable.
+const MAX_RASTER_PIXELS: f32 = 16_000_000.0;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum Key {
@@ -26,10 +35,13 @@ enum Key {
         source: String,
         px: u32,
         transparent: bool,
+        /// Extra raster depth for a zoomable diagram, in hundredths.
+        zoom: u32,
     },
     Graphviz {
         source: String,
         px: u32,
+        zoom: u32,
     },
     Image {
         path: String,
@@ -106,6 +118,10 @@ pub struct Media {
     gifs: RefCell<HashMap<String, Option<std::rc::Rc<Gif>>>>,
     /// SVGs already reported as self-clipping (see `warn_if_clipped`).
     warned_svgs: RefCell<std::collections::HashSet<String>>,
+    /// Where labelled nodes sit in a diagram, for zooming onto them (see
+    /// [`Media::diagram_region`]), keyed by (language, source, transparent,
+    /// labels).
+    regions: RefCell<HashMap<RegionKey, Option<iced::Rectangle>>>,
 }
 
 impl Media {
@@ -126,6 +142,7 @@ impl Media {
             cache: RefCell::new(HashMap::new()),
             gifs: RefCell::new(HashMap::new()),
             warned_svgs: RefCell::new(std::collections::HashSet::new()),
+            regions: RefCell::new(HashMap::new()),
         }
     }
 
@@ -247,19 +264,24 @@ impl Media {
                 .math_svg(latex, true, color, px as f32 * OVERSAMPLE)
                 .map_err(|e| tracing::warn!(error = %e, latex, "math render failed"))
                 .ok()?;
-            self.to_handle(&svg, 1.0)
+            self.to_handle(&svg, 1.0, OVERSAMPLE)
         })
     }
 
     /// Mermaid diagram at a logical scale factor. `target_width` (logical
     /// pixels, from a `{width=NN%}` annotation) overrides the intrinsic
     /// size; the raster is produced at exactly that size for crispness.
+    ///
+    /// `zoom` (`1.0` normally) rasterizes that much deeper without changing
+    /// the logical size, so a diagram the camera zooms into stays sharp at
+    /// its deepest zoom (see `zoom.rs`).
     pub fn mermaid(
         &self,
         source: &str,
         scale: f32,
         target_width: Option<f32>,
         transparent: bool,
+        zoom: f32,
     ) -> Entry {
         let px = target_width
             .map(|w| w.round() as u32)
@@ -268,6 +290,7 @@ impl Media {
             source: source.to_string(),
             px,
             transparent,
+            zoom: (zoom * 100.0).round() as u32,
         };
         self.lookup(key, || {
             let svg = self
@@ -275,18 +298,25 @@ impl Media {
                 .mermaid_svg(source, transparent)
                 .map_err(|e| tracing::warn!(error = %e, "mermaid render failed"))
                 .ok()?;
-            self.svg_entry(&svg, target_width, scale)
+            self.svg_entry_zoomed(&svg, target_width, scale, zoom)
         })
     }
 
     /// Graphviz DOT diagram; same sizing contract as [`Self::mermaid`].
-    pub fn graphviz(&self, source: &str, scale: f32, target_width: Option<f32>) -> Entry {
+    pub fn graphviz(
+        &self,
+        source: &str,
+        scale: f32,
+        target_width: Option<f32>,
+        zoom: f32,
+    ) -> Entry {
         let px = target_width
             .map(|w| w.round() as u32)
             .unwrap_or_else(|| (scale * 100.0).round() as u32);
         let key = Key::Graphviz {
             source: source.to_string(),
             px,
+            zoom: (zoom * 100.0).round() as u32,
         };
         self.lookup(key, || {
             let svg = self
@@ -294,8 +324,46 @@ impl Media {
                 .graphviz_svg(source)
                 .map_err(|e| tracing::warn!(error = %e, "graphviz render failed"))
                 .ok()?;
-            self.svg_entry(&svg, target_width, scale)
+            self.svg_entry_zoomed(&svg, target_width, scale, zoom)
         })
+    }
+
+    /// Where the nodes labelled `labels` sit in a Mermaid (`language`
+    /// `mermaid`) or Graphviz (`dot`/`graphviz`) diagram, as fractions of
+    /// its size — the region a diagram zoom stage fits. Cached; `None` when
+    /// no label matches or the diagram doesn't render.
+    pub fn diagram_region(
+        &self,
+        language: &str,
+        source: &str,
+        transparent: bool,
+        labels: &[String],
+    ) -> Option<iced::Rectangle> {
+        let key = (
+            language.to_string(),
+            source.to_string(),
+            transparent,
+            labels.to_vec(),
+        );
+        if let Some(region) = self.regions.borrow().get(&key) {
+            return *region;
+        }
+        let svg = match language {
+            "mermaid" => self.renderer.mermaid_svg(source, transparent).ok(),
+            _ => self.renderer.graphviz_svg(source).ok(),
+        };
+        let region = svg
+            .and_then(|svg| self.renderer.label_region(&svg, labels).ok().flatten())
+            .map(|r| iced::Rectangle::new(iced::Point::new(r.x, r.y), Size::new(r.w, r.h)));
+        if region.is_none() {
+            tracing::warn!(?labels, "diagram zoom: no node with that label");
+        }
+        let mut regions = self.regions.borrow_mut();
+        if regions.len() >= Self::MAX_ENTRIES {
+            regions.clear();
+        }
+        regions.insert(key, region);
+        region
     }
 
     /// Slide image (`![alt](path)`), resolved relative to the deck file.
@@ -357,6 +425,28 @@ impl Media {
             return;
         }
         self.warned_svgs.borrow_mut().insert(url.to_string());
+
+        // A font the file names and this machine hasn't got. The text is
+        // substituted rather than lost (see `Renderer::with_font_fallback`),
+        // but it will be set in something other than what the author drew
+        // with, and the metrics differ — which is often what pushes content
+        // past the canvas the file declares, reported just below.
+        let missing = self.renderer.missing_font_families(svg);
+        if !missing.is_empty() {
+            tracing::warn!(
+                image = url,
+                "SVG asks for {} — not installed here, so its text is set in a \
+                 substitute instead. It renders, but not in the face it was drawn \
+                 with; install the font, or give the file a generic fallback \
+                 (`font-family=\"Arial, sans-serif\"`) or text converted to paths",
+                missing
+                    .iter()
+                    .map(|f| format!("`{f}`"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
+        }
+
         let Ok(overflow) = self.renderer.svg_overflow(svg) else {
             return;
         };
@@ -508,25 +598,42 @@ impl Media {
     /// raster to the displayed width keeps vector content crisp), else at
     /// `fallback_scale`. Both paths oversample for hidpi.
     fn svg_entry(&self, svg: &str, target_width: Option<f32>, fallback_scale: f32) -> Entry {
-        let raster_scale = match target_width {
-            Some(width) => {
-                let (intrinsic_w, _) = self.renderer.svg_size(svg).ok()?;
-                (width / intrinsic_w) * OVERSAMPLE
-            }
-            None => fallback_scale * OVERSAMPLE,
-        };
-        self.to_handle(svg, raster_scale)
+        self.svg_entry_zoomed(svg, target_width, fallback_scale, 1.0)
     }
 
-    fn to_handle(&self, svg: &str, raster_scale: f32) -> Entry {
+    /// [`Self::svg_entry`], rasterized `zoom` times deeper at the same
+    /// logical size — as deep as the texture limit allows.
+    fn svg_entry_zoomed(
+        &self,
+        svg: &str,
+        target_width: Option<f32>,
+        fallback_scale: f32,
+        zoom: f32,
+    ) -> Entry {
+        let (intrinsic_w, intrinsic_h) = self.renderer.svg_size(svg).ok()?;
+        let raster_scale = match target_width {
+            Some(width) => (width / intrinsic_w) * OVERSAMPLE,
+            None => fallback_scale * OVERSAMPLE,
+        };
+        let (w, h) = (intrinsic_w * raster_scale, intrinsic_h * raster_scale);
+        let zoom = zoom
+            .min(MAX_RASTER_SIDE / w.max(h).max(1.0))
+            .min((MAX_RASTER_PIXELS / (w * h).max(1.0)).sqrt())
+            .max(1.0);
+        self.to_handle(svg, raster_scale * zoom, OVERSAMPLE * zoom)
+    }
+
+    /// Rasterize at `raster_scale`; the image's logical size is its pixels
+    /// over `per_logical`.
+    fn to_handle(&self, svg: &str, raster_scale: f32, per_logical: f32) -> Entry {
         let raster = self
             .renderer
             .rasterize(svg, raster_scale)
             .map_err(|e| tracing::warn!(error = %e, "rasterize failed"))
             .ok()?;
         let logical = Size::new(
-            raster.width as f32 / OVERSAMPLE,
-            raster.height as f32 / OVERSAMPLE,
+            raster.width as f32 / per_logical,
+            raster.height as f32 / per_logical,
         );
         Some((
             image::Handle::from_rgba(raster.width, raster.height, raster.rgba),

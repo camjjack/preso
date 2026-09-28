@@ -1,0 +1,186 @@
+{
+  "name": "preso",
+  "displayName": "preso",
+  "description": "Slide outline, diagnostics, completions and layout code actions for preso markdown decks",
+  "version": "0.1.0",
+  "publisher": "camjjack",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/camjjack/preso"
+  },
+  "engines": {
+    "vscode": "^1.91.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Linters"
+  ],
+  "keywords": [
+    "preso",
+    "slides",
+    "presentation",
+    "markdown"
+  ],
+  "activationEvents": [
+    "onLanguage:markdown"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "configuration": {
+      "title": "preso",
+      "properties": {
+        "preso.server.path": {
+          "type": "string",
+          "default": "preso-lsp",
+          "markdownDescription": "Path to the `preso-lsp` binary. The default finds it on `PATH`."
+        },
+        "preso.trace.server": {
+          "type": "string",
+          "enum": [
+            "off",
+            "messages",
+            "verbose"
+          ],
+          "default": "off",
+          "description": "Log the protocol traffic with the language server to the output panel."
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "preso.twoColumns",
+        "title": "Layout: two columns",
+        "category": "preso"
+      },
+      {
+        "command": "preso.singleColumn",
+        "title": "Layout: single column",
+        "category": "preso"
+      },
+      {
+        "command": "preso.titleSlide",
+        "title": "Layout: title slide",
+        "category": "preso"
+      },
+      {
+        "command": "preso.sectionSlide",
+        "title": "Layout: section slide",
+        "category": "preso"
+      },
+      {
+        "command": "preso.normalSlide",
+        "title": "Layout: normal slide",
+        "category": "preso"
+      },
+      {
+        "command": "preso.insertSlideAfter",
+        "title": "Slide: insert a new slide after",
+        "category": "preso"
+      },
+      {
+        "command": "preso.duplicateSlide",
+        "title": "Slide: duplicate",
+        "category": "preso"
+      },
+      {
+        "command": "preso.moveSlideUp",
+        "title": "Slide: move up",
+        "category": "preso"
+      },
+      {
+        "command": "preso.moveSlideDown",
+        "title": "Slide: move down",
+        "category": "preso"
+      },
+      {
+        "command": "preso.hideSlide",
+        "title": "Slide: hide",
+        "category": "preso"
+      },
+      {
+        "command": "preso.unhideSlide",
+        "title": "Slide: unhide",
+        "category": "preso"
+      },
+      {
+        "command": "preso.insertImage",
+        "title": "Insert the newest image",
+        "category": "preso"
+      },
+      {
+        "command": "preso.backgroundImage",
+        "title": "Background image: the newest image",
+        "category": "preso"
+      },
+      {
+        "command": "preso.insertVideo",
+        "title": "Insert the newest video",
+        "category": "preso"
+      }
+    ],
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "preso.twoColumns",
+          "when": "editorLangId == markdown"
+        },
+        {
+          "command": "preso.singleColumn",
+          "when": "editorLangId == markdown"
+        },
+        {
+          "command": "preso.titleSlide",
+          "when": "editorLangId == markdown"
+        },
+        {
+          "command": "preso.sectionSlide",
+          "when": "editorLangId == markdown"
+        },
+        {
+          "command": "preso.normalSlide",
+          "when": "editorLangId == markdown"
+        },
+        {
+          "command": "preso.insertSlideAfter",
+          "when": "editorLangId == markdown"
+        },
+        {
+          "command": "preso.duplicateSlide",
+          "when": "editorLangId == markdown"
+        },
+        {
+          "command": "preso.moveSlideUp",
+          "when": "editorLangId == markdown"
+        },
+        {
+          "command": "preso.moveSlideDown",
+          "when": "editorLangId == markdown"
+        },
+        {
+          "command": "preso.hideSlide",
+          "when": "editorLangId == markdown"
+        },
+        {
+          "command": "preso.unhideSlide",
+          "when": "editorLangId == markdown"
+        },
+        {
+          "command": "preso.insertImage",
+          "when": "editorLangId == markdown"
+        },
+        {
+          "command": "preso.backgroundImage",
+          "when": "editorLangId == markdown"
+        },
+        {
+          "command": "preso.insertVideo",
+          "when": "editorLangId == markdown"
+        }
+      ]
+    }
+  },
+  "dependencies": {
+    "vscode-languageclient": "^10.1.1"
+  }
+}

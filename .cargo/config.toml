@@ -1,0 +1,6 @@
+[env]
+# Offscreen renders (iced_test's Simulator) use the software renderer in
+# tests, as `--export` does in the app: deterministic, no GPU needed, and
+# images load synchronously — wgpu uploads large ones on a worker thread, so
+# a one-shot snapshot would miss them.
+ICED_TEST_BACKEND = "tiny-skia"

@@ -1,5 +1,6 @@
 mod app;
 mod audience;
+mod clip;
 mod export;
 mod hot_reload;
 
@@ -13,6 +14,7 @@ mod timer;
 mod transition;
 mod video;
 mod window_state;
+mod zoom;
 
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
@@ -172,15 +174,18 @@ fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|| std::path::Path::new("."));
     let source = preso_core::include::expand(&source, deck_dir)?;
 
-    // Theme priority: CLI flag > frontmatter > default (dark).
-    let theme_name = cli.theme.clone().or_else(|| {
-        preso_core::parser::parse(&source)
-            .ok()
-            .and_then(|d| d.frontmatter.theme)
-    });
-    let theme = match &theme_name {
-        Some(name) => preso_style::load_with_search(name, &app::theme_search_dirs())?,
-        None => preso_style::Theme::default(),
+    // Theme priority: CLI flag > frontmatter > default (dark). A `--theme`
+    // path is taken from where preso was run; the frontmatter's from the
+    // deck's folder, like its images.
+    let deck_theme = preso_core::parser::parse(&source)
+        .ok()
+        .and_then(|d| d.frontmatter.theme);
+    let theme = match (&cli.theme, &deck_theme) {
+        (Some(name), _) => preso_style::load_with_search(name, &app::theme_search_dirs())?,
+        (None, Some(name)) => {
+            preso_style::load_for_deck(name, &app::theme_search_dirs(), deck_dir)?
+        }
+        (None, None) => preso_style::Theme::default(),
     };
 
     let theme_fonts = load_theme_fonts(&theme);

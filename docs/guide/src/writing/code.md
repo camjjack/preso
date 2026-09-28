@@ -49,6 +49,35 @@ That slide highlights lines 2–3, then line 5, then nothing — over three
 presses. Click-through stages count as [reveal steps](reveal-steps.md), so they
 share the same step counter as your `<!-- pause -->` builds.
 
+## Zooming onto lines
+
+Add a `zoom` flag and each stage also *zooms* onto its lines: the camera eases
+in until they fill the room the block has, then on to the next stage's lines,
+and back out for an `all` stage:
+
+````markdown
+```rust {all|3-4|6 zoom}
+use std::io;
+
+fn main() -> io::Result<()> {
+    let config = load_config("preso.toml")?;
+    let deck = parse(&config)?;
+    present(deck)
+}
+```
+````
+
+That slide opens on the whole listing, zooms onto lines 3–4, then onto line 6.
+Start with `all` to open unzoomed; without it the first stage is zoomed from
+the moment the slide appears.
+
+The zoom magnifies the rendered block rather than re-laying it out, so the
+lines keep their shape and stay sharp (up to 4×). A zooming block claims the
+rest of the slide below it as room to zoom into, so put it last on the slide —
+anything after it sits at the bottom. The zoom eases in on the audience window;
+the presenter view, PDF pages and slide thumbnails show each stage already
+zoomed.
+
 ## Font size
 
 One oversized listing that won't fit? Add `size=NN` to the fence annotation to

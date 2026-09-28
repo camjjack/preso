@@ -19,9 +19,11 @@ On a slide with an [inline video](../writing/video.md#inline-playback),
 <kbd>Space</kbd> plays/pauses the clip instead of advancing (use <kbd>→</kbd> /
 <kbd>PageDown</kbd> to move on), and while it's **playing** <kbd>←</kbd> scrubs
 back a few seconds while <kbd>⌥</kbd><kbd>←</kbd> (Option/Alt) rewinds to the
-start. Before you start the clip, and on non-video slides, these keys navigate
+start. <kbd>,</kbd> and <kbd>.</kbd> pause the clip and step one frame back or
+on. Before you start the clip, and on non-video slides, these keys navigate
 as usual; <kbd>↑</kbd> / <kbd>Backspace</kbd> / <kbd>PageUp</kbd> always go to
-the previous slide.
+the previous slide. To jump anywhere in the clip, drag the scrub bar under the
+presenter's current slide.
 
 In the **overview grid**, click a thumbnail — or type a number and press
 <kbd>Enter</kbd> — to jump to that slide. Opening it scrolls to the current
