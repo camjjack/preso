@@ -13,9 +13,7 @@ No browser, no Electron, no network. Slides render on the GPU (wgpu) by
 default, with a software rasterizer (tiny-skia) fallback via `--software` for
 machines where the GPU backend misbehaves.
 
-<p align="center">
-  <a href="docs/showcase.mp4"><img src="docs/assets/showcase.png" alt="The example talk's markdown beside the slide preso renders from it" width="860"></a>
-</p>
+https://github.com/user-attachments/assets/7da56692-c420-444a-a1d0-41588eac4773
 
 <p align="center"><a href="docs/showcase.mp4">▶ Watch the tour</a>: <a href="docs/example-talk.md"><code>docs/example-talk.md</code></a>, slide by slide, beside what preso renders.</p>
 
